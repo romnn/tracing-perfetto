@@ -50,7 +50,7 @@ fn ended_slice_names(slices: &[ReplayedSlice]) -> Vec<&str> {
 #[gtest]
 fn overlapping_spans_with_one_track_name_get_distinct_tracks() -> Result<()> {
     let (layer, output) = annotated_layer();
-    let process_track_uuid = layer.sequence.process_track_uuid();
+    let process_track_uuid = layer.process_track_uuid();
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
     // The first begins, the second begins, the first ends and the second ends.
@@ -106,7 +106,7 @@ fn overlapping_spans_with_one_track_name_get_distinct_tracks() -> Result<()> {
 #[gtest]
 fn sequential_children_nest_on_the_parent_track() -> Result<()> {
     let (layer, output) = annotated_layer();
-    let process_track_uuid = layer.sequence.process_track_uuid();
+    let process_track_uuid = layer.process_track_uuid();
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
     let root = trace_span!("root", closes = field::Empty);

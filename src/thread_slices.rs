@@ -4,8 +4,8 @@
 //! A span exits in any order and may be entered several times at once, on one thread or on
 //! several, so every exit is matched against the calling thread's own stack.
 
-use crate::idl_helpers::{self, DebugAnnotations};
-use crate::{LayerId, idl};
+use crate::layer::LayerId;
+use crate::{idl, packets};
 use std::cell::RefCell;
 use tracing::Id;
 
@@ -30,12 +30,12 @@ struct EnteredFrame {
 
 impl EnteredFrame {
     fn end(&self) -> idl::TrackEvent {
-        idl_helpers::create_event(
+        packets::create_event(
             self.begin.track_uuid(),
             None,
             None,
-            DebugAnnotations::default(),
-            Some(idl::track_event::Type::SliceEnd),
+            Vec::new(),
+            idl::track_event::Type::SliceEnd,
         )
     }
 }
@@ -44,7 +44,7 @@ impl EnteredFrame {
 ///
 /// Returns `false` during thread teardown, when the stack is gone, in which case the caller
 /// writes no begin, since no exit could end its slice.
-pub fn enter(layer_id: LayerId, span_id: Id, begin: &idl::TrackEvent) -> bool {
+pub(crate) fn enter(layer_id: LayerId, span_id: Id, begin: &idl::TrackEvent) -> bool {
     ENTERED_SPANS
         .try_with(|layers| {
             let frame = EnteredFrame {
@@ -71,7 +71,7 @@ pub fn enter(layer_id: LayerId, span_id: Id, begin: &idl::TrackEvent) -> bool {
 ///
 /// Returns the slice events to write on the thread's track, in order, all at one timestamp.
 /// They are empty when the span is not on the stack, so an unmatched exit ends nothing.
-pub fn exit(layer_id: LayerId, span_id: &Id) -> Vec<idl::TrackEvent> {
+pub(crate) fn exit(layer_id: LayerId, span_id: &Id) -> Vec<idl::TrackEvent> {
     ENTERED_SPANS
         .try_with(|layers| {
             let mut layers = layers.borrow_mut();

@@ -1,6 +1,7 @@
 //! The trusted packet sequence a layer writes on, with its clock and preamble.
 
-use crate::{PerfettoWriter, idl, idl_helpers};
+use crate::writer::PerfettoWriter;
+use crate::{idl, packets};
 use bytes::BytesMut;
 use prost::Message;
 use std::sync::Once;
@@ -10,17 +11,18 @@ use std::time::{Duration, Instant, SystemTime};
 ///
 /// IDs 64 to 127 are user-defined clocks scoped to one trusted packet sequence, so each layer
 /// defines its own clock without colliding with another layer's.
-pub const SEQUENCE_CLOCK_ID: u32 = 64;
+pub(crate) const SEQUENCE_CLOCK_ID: u32 = 64;
 
 /// The packet sequence shared by a layer and its process-memory sampler.
 ///
 /// Every packet that reads [`SEQUENCE_CLOCK_ID`] must follow the preamble that defines it, so
 /// [`TraceSequence::write`] is the only way packets reach the writer.
-pub struct TraceSequence {
+pub(crate) struct TraceSequence {
     sequence_id: u32,
     process_track_uuid: u64,
     /// The zero point of [`SEQUENCE_CLOCK_ID`].
     epoch: Instant,
+    /// Completes once the preamble has been handed to the writer.
     preamble: Once,
 }
 
@@ -29,31 +31,32 @@ impl TraceSequence {
     ///
     /// Sequence ID 0 is invalid and the tracing service reserves 1 for its own packets, so the
     /// random ID starts at 2.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sequence_id: rand::random_range(2..=u32::MAX),
-            process_track_uuid: idl_helpers::unique_uuid(),
+            process_track_uuid: packets::unique_uuid(),
             epoch: Instant::now(),
             preamble: Once::new(),
         }
     }
 
-    pub fn process_track_uuid(&self) -> u64 {
+    /// Returns the UUID of the process track that the preamble describes.
+    pub(crate) fn process_track_uuid(&self) -> u64 {
         self.process_track_uuid
     }
 
     /// Returns the current time on [`SEQUENCE_CLOCK_ID`], in nanoseconds since the epoch.
-    pub fn now(&self) -> u64 {
+    pub(crate) fn now(&self) -> u64 {
         duration_nanos(self.epoch.elapsed())
     }
 
     /// Returns a packet on this sequence, timestamped now on [`SEQUENCE_CLOCK_ID`].
-    pub fn timestamped_packet(&self) -> idl::TracePacket {
+    pub(crate) fn timestamped_packet(&self) -> idl::TracePacket {
         self.packet_at(self.now())
     }
 
     /// Returns a packet on this sequence, timestamped at `timestamp` on [`SEQUENCE_CLOCK_ID`].
-    pub fn packet_at(&self, timestamp: u64) -> idl::TracePacket {
+    pub(crate) fn packet_at(&self, timestamp: u64) -> idl::TracePacket {
         idl::TracePacket {
             timestamp: Some(timestamp),
             timestamp_clock_id: Some(SEQUENCE_CLOCK_ID),
@@ -61,6 +64,9 @@ impl TraceSequence {
         }
     }
 
+    /// Returns a packet on this sequence without a timestamp.
+    ///
+    /// The sequence ID scopes [`SEQUENCE_CLOCK_ID`] to this sequence.
     fn untimestamped_packet(&self) -> idl::TracePacket {
         idl::TracePacket {
             trusted_pid: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
@@ -77,7 +83,7 @@ impl TraceSequence {
     ///
     /// Concurrent first writes block until the preamble is written, so on a writer that applies
     /// writes in call order no packet of this sequence precedes it.
-    pub fn write<W: PerfettoWriter + ?Sized>(&self, writer: &W, trace: &idl::Trace) {
+    pub(crate) fn write<W: PerfettoWriter + ?Sized>(&self, writer: &W, trace: &idl::Trace) {
         // Forcing past a poisoned guard retries the preamble after a panicking writer, instead of
         // panicking on every later write.
         self.preamble
@@ -116,7 +122,7 @@ impl TraceSequence {
 
         idl::Trace {
             packet: vec![
-                idl_helpers::process_descriptor(self.process_track_uuid),
+                packets::process_descriptor_packet(self.process_track_uuid),
                 idl::TracePacket {
                     data: Some(idl::trace_packet::Data::ClockSnapshot(clock_snapshot)),
                     ..self.untimestamped_packet()
@@ -126,10 +132,15 @@ impl TraceSequence {
     }
 }
 
+/// Returns `duration` in nanoseconds, saturating at [`u64::MAX`] after about 584 years.
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Encodes `trace` and hands it to `writer` as one buffer.
+///
+/// A failed write loses only this message, so the error is dropped rather than stopping the
+/// layer.
 fn write_encoded<W: PerfettoWriter + ?Sized>(writer: &W, trace: &idl::Trace) {
     let mut buf = BytesMut::new();
     let Ok(()) = trace.encode(&mut buf) else {
