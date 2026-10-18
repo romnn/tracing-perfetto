@@ -6,10 +6,10 @@
 //! child always closes before its parent, the parent's slice is then the innermost open slice on
 //! that track.
 
-use crate::{idl, packets};
+use crate::{idl, packets, thread_track};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{Id, Subscriber};
+use tracing::{Id, Metadata, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::{ExtensionsMut, LookupSpan, SpanRef};
 
@@ -37,13 +37,8 @@ pub(crate) struct SpanState {
     /// It is random and the span's own, so it never links a span to a parent whose track it
     /// shares.
     pub(crate) correlation_id: u64,
-    /// The span's lifetime slice, if span lifetimes are recorded.
-    pub(crate) lifetime: Option<LifetimeSlice>,
-    /// The fields given at the span's creation, written on each entered slice's begin.
-    ///
-    /// This stays empty while span lifetimes are recorded, because the lifetime slice's begin
-    /// carries these fields instead.
-    pub(crate) creation_annotations: Vec<idl::DebugAnnotation>,
+    /// The slices that carry the span's fields.
+    pub(crate) kind: SpanKind,
     /// The fields recorded after the span's creation.
     ///
     /// They are written on the lifetime slice's end, or, without span lifetimes, on the begin of
@@ -51,24 +46,88 @@ pub(crate) struct SpanState {
     pub(crate) recorded_annotations: Vec<idl::DebugAnnotation>,
 }
 
+impl SpanState {
+    /// Returns the span's lifetime slice, if span lifetimes are recorded.
+    pub(crate) fn lifetime(&self) -> Option<&LifetimeSlice> {
+        match &self.kind {
+            SpanKind::Lifetime(lifetime) => Some(lifetime),
+            SpanKind::Entered { .. } => None,
+        }
+    }
+
+    fn lifetime_mut(&mut self) -> Option<&mut LifetimeSlice> {
+        match &mut self.kind {
+            SpanKind::Lifetime(lifetime) => Some(lifetime),
+            SpanKind::Entered { .. } => None,
+        }
+    }
+
+    /// Builds the begin of a slice of the span entered on the calling thread.
+    ///
+    /// `metadata` is the span's, whose source location the begin carries if the span has no
+    /// lifetime slice to carry it.
+    pub(crate) fn entered_slice_begin(
+        &self,
+        metadata: &'static Metadata<'static>,
+    ) -> idl::TrackEvent {
+        let (annotations, location) = match &self.kind {
+            SpanKind::Lifetime(_) => (Vec::new(), None),
+            SpanKind::Entered {
+                creation_annotations,
+            } => (
+                creation_annotations
+                    .iter()
+                    .chain(&self.recorded_annotations)
+                    .cloned()
+                    .collect(),
+                metadata.file().zip(metadata.line()),
+            ),
+        };
+        let mut event = packets::create_event(
+            thread_track::current_thread_uuid(),
+            Some(&self.slice_name),
+            location,
+            annotations,
+            idl::track_event::Type::SliceBegin,
+        );
+        event.correlation_id_field = Some(idl::track_event::CorrelationIdField::CorrelationId(
+            self.correlation_id,
+        ));
+        event
+    }
+}
+
+/// How a span is recorded, which decides the slices that carry its fields and source location.
+pub(crate) enum SpanKind {
+    /// The span has a lifetime slice from its creation to its close, which carries its fields and
+    /// source location, so its entered slices carry neither.
+    Lifetime(LifetimeSlice),
+    /// The span has only entered slices, and the begin of each carries its fields and source
+    /// location.
+    Entered {
+        /// The fields given at the span's creation.
+        creation_annotations: Vec<idl::DebugAnnotation>,
+    },
+}
+
 /// The lifetime slice of a span that a [`PerfettoLayer`](crate::PerfettoLayer) has begun and not
 /// yet ended.
 pub(crate) struct LifetimeSlice {
     /// The track that holds the span's slice.
     pub(crate) track_uuid: u64,
-    /// The number of the span's open children whose slices nest on the span's track.
+    /// Whether the slice of one of the span's open children nests on the span's track.
     ///
-    /// A new child nests on the track only while this is 0, so the span's slice is then the
+    /// A new child nests on the track only while it is free, so the span's slice is then the
     /// innermost open slice there.
-    open_children_on_track: usize,
+    track_occupied: bool,
     /// The span whose track this span's slice nests on, if any.
     ///
-    /// This span holds one count of that span's `open_children_on_track` until it closes.
-    track_parent: Option<Id>,
+    /// This span occupies that span's track until it closes.
+    occupies: Option<Id>,
 }
 
 impl LifetimeSlice {
-    /// Frees the track that this slice shares with its track parent, once its end is written.
+    /// Frees the track that this slice occupies, once its end is written.
     ///
     /// Freeing the track only after the end lets a sibling that nests there next begin after
     /// this slice ended.
@@ -76,15 +135,19 @@ impl LifetimeSlice {
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
-        if let Some(track_parent_id) = self.track_parent
-            && let Some(track_parent) = ctx.span(&track_parent_id)
-            && let Some(states) = track_parent.extensions_mut().get_mut::<SpanStates>()
-            && let Some(track_parent_state) = states
-                .get_mut(layer_id)
-                .and_then(|state| state.lifetime.as_mut())
+        // The registry closes every child before its parent, and a child frees the track when it
+        // closes.
+        debug_assert!(
+            !self.track_occupied,
+            "a span closed while a child's slice nests on its track"
+        );
+        if let Some(occupied_id) = self.occupies
+            && let Some(occupied) = ctx.span(&occupied_id)
+            && let Some(states) = occupied.extensions_mut().get_mut::<SpanStates>()
+            && let Some(occupied_lifetime) =
+                states.get_mut(layer_id).and_then(SpanState::lifetime_mut)
         {
-            track_parent_state.open_children_on_track =
-                track_parent_state.open_children_on_track.saturating_sub(1);
+            occupied_lifetime.track_occupied = false;
         }
     }
 }
@@ -106,8 +169,8 @@ impl SpanPlacement {
         Self {
             lifetime: LifetimeSlice {
                 track_uuid,
-                open_children_on_track: 0,
-                track_parent: None,
+                track_occupied: false,
+                occupies: None,
             },
             new_track: Some(idl::TrackDescriptor {
                 uuid: Some(track_uuid),
@@ -144,19 +207,19 @@ where
         let Some(ancestor_state) = extensions
             .get_mut::<SpanStates>()
             .and_then(|states| states.get_mut(layer_id))
-            .and_then(|state| state.lifetime.as_mut())
+            .and_then(SpanState::lifetime_mut)
         else {
             continue;
         };
 
         // Nest on the ancestor's track
-        if ancestor_state.open_children_on_track == 0 {
-            ancestor_state.open_children_on_track = 1;
+        if !ancestor_state.track_occupied {
+            ancestor_state.track_occupied = true;
             return SpanPlacement {
                 lifetime: LifetimeSlice {
                     track_uuid: ancestor_state.track_uuid,
-                    open_children_on_track: 0,
-                    track_parent: Some(ancestor.id()),
+                    track_occupied: false,
+                    occupies: Some(ancestor.id()),
                 },
                 new_track: None,
             };

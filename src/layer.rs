@@ -7,7 +7,9 @@ use crate::packets::{self, create_event};
 use crate::process_memory::sampler::{ProcessMemorySampler, ProcessMemorySamplerConfig};
 use crate::process_memory::{self, ProcessMemorySource};
 use crate::sequence::TraceSequence;
-use crate::span_state::{self, LayerId, LifetimeSlice, SpanPlacement, SpanState, SpanStates};
+use crate::span_state::{
+    self, LayerId, LifetimeSlice, SpanKind, SpanPlacement, SpanState, SpanStates,
+};
 use crate::thread_state::ThreadStates;
 use crate::writer::PerfettoWriter;
 use crate::{idl, thread_track};
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::field::Visit;
 use tracing::span;
-use tracing::{Event, Id, Metadata, Subscriber};
+use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::{LookupSpan, SpanRef};
@@ -317,42 +319,6 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self.write_packets(trace_packets);
         lifetime
     }
-
-    /// Builds the begin of a slice of `span_state` entered on the calling thread.
-    ///
-    /// A lifetime slice carries the span's fields and source location, so an entered slice
-    /// repeats them only when span lifetimes are off.
-    fn entered_slice_begin(
-        &self,
-        metadata: &'static Metadata<'static>,
-        span_state: &SpanState,
-    ) -> idl::TrackEvent {
-        let with_details = !self.config.span_lifetimes;
-        let annotations = if with_details {
-            span_state
-                .creation_annotations
-                .iter()
-                .chain(&span_state.recorded_annotations)
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let location = with_details
-            .then(|| metadata.file().zip(metadata.line()))
-            .flatten();
-        let mut event = create_event(
-            thread_track::current_thread_uuid(),
-            Some(&span_state.slice_name),
-            location,
-            annotations,
-            idl::track_event::Type::SliceBegin,
-        );
-        event.correlation_id_field = Some(idl::track_event::CorrelationIdField::CorrelationId(
-            span_state.correlation_id,
-        ));
-        event
-    }
 }
 
 #[cfg(test)]
@@ -401,28 +367,27 @@ where
             .slice_name
             .map_or(Cow::Borrowed(span.name()), Cow::Owned);
 
-        // Without a lifetime slice to carry them, the creation fields go on every entered slice.
-        let creation_annotations = if self.config.span_lifetimes {
-            Vec::new()
-        } else {
-            std::mem::take(&mut debug_annotations.annotations)
-        };
         let correlation_id = packets::unique_uuid();
-        let lifetime = self.config.span_lifetimes.then(|| {
-            self.begin_lifetime_slice(
+        let kind = if self.config.span_lifetimes {
+            SpanKind::Lifetime(self.begin_lifetime_slice(
                 &span,
                 naming.track_name.as_deref(),
                 &slice_name,
                 correlation_id,
                 debug_annotations.annotations,
-            )
-        });
+            ))
+        } else {
+            // Without a lifetime slice to carry them, the creation fields go on every entered
+            // slice.
+            SpanKind::Entered {
+                creation_annotations: debug_annotations.annotations,
+            }
+        };
 
         let span_state = SpanState {
             slice_name,
             correlation_id,
-            lifetime,
-            creation_annotations,
+            kind,
             recorded_annotations: Vec::new(),
         };
         SpanStates::insert(&mut span.extensions_mut(), self.layer_id, span_state);
@@ -478,7 +443,7 @@ where
                 span.extensions()
                     .get::<SpanStates>()
                     .and_then(|states| states.get(self.layer_id))
-                    .and_then(|span_state| span_state.lifetime.as_ref())
+                    .and_then(SpanState::lifetime)
                     .map(|lifetime| lifetime.track_uuid)
             })
         });
@@ -505,7 +470,7 @@ where
             else {
                 return;
             };
-            self.entered_slice_begin(span.metadata(), span_state)
+            span_state.entered_slice_begin(span.metadata())
         };
         // During thread teardown no exit could end the slice, so the layer writes no begin.
         let entered = self
@@ -544,7 +509,7 @@ where
         else {
             return;
         };
-        let Some(lifetime) = span_state.lifetime else {
+        let SpanKind::Lifetime(lifetime) = span_state.kind else {
             return;
         };
 
