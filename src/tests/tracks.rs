@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::instrument::{Instrument as _, WithSubscriber as _};
 use tracing::{field, trace_span};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
 /// Returns the UUID of the one span track named `name`.
@@ -156,6 +158,70 @@ fn sequential_children_nest_on_the_parent_track() -> Result<()> {
             eq(&("second", root_track, 1, true)),
             eq(&("grandchild", root_track, 2, true)),
         ]
+    );
+    Ok(())
+}
+
+/// Under a per-layer filter, a child of a filtered-out span nests on its nearest recorded
+/// ancestor's track, and events inside the filtered-out span are instants there.
+///
+/// The filtered-out span has no slice, so a child that looked only at its direct parent would
+/// become a root on a track of its own, and an event inside that parent would land on the
+/// thread's track, splitting one call chain across unrelated tracks.
+#[gtest]
+fn child_of_a_filtered_out_span_nests_on_its_nearest_recorded_ancestor() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let layer = layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out"));
+    // Another layer records every span, so the filtered-out span exists in the registry instead
+    // of being disabled at its callsite.
+    let every_span = tracing_subscriber::fmt::layer().with_writer(std::io::sink);
+    let subscriber = tracing_subscriber::registry().with(layer).with(every_span);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    trace_span!("root").in_scope(|| {
+        trace_span!("filtered_out").in_scope(|| {
+            tracing::info!(marker = "in the filtered-out span");
+            trace_span!("child").in_scope(|| {});
+        });
+    });
+
+    let trace = decode(&output)?;
+    let slices = replay_slices(&trace)?;
+    let [thread_track] = thread_track_uuids(&trace)[..] else {
+        return fail!("expected one thread track");
+    };
+
+    // The root's track is the only span track, and the child nests on it below the root.
+    let root_track = span_track_named(&trace, "root")?;
+    expect_that!(span_track_descriptors(&trace), len(eq(1)));
+    let lifetimes: Vec<_> = replay_lifetime_slices(&trace)?
+        .into_iter()
+        .map(|slice| (slice.name, slice.track_uuid, slice.depth))
+        .collect();
+    expect_that!(
+        lifetimes,
+        elements_are![
+            eq(&("root".to_string(), root_track, 0)),
+            eq(&("child".to_string(), root_track, 1))
+        ]
+    );
+
+    // The event inside the filtered-out span is an instant on the root's track.
+    expect_eq!(
+        instant_marked(&trace, "in the filtered-out span")?
+            .event
+            .track_uuid,
+        Some(root_track)
+    );
+
+    // The filtered-out span has no slice on any track, the thread's included.
+    expect_that!(
+        slices
+            .iter()
+            .filter(|slice| slice.track_uuid == thread_track)
+            .map(|slice| (slice.name.as_str(), slice.depth))
+            .collect::<Vec<_>>(),
+        elements_are![eq(&("root", 0)), eq(&("child", 1))]
     );
     Ok(())
 }

@@ -15,8 +15,9 @@ It provides:
   or never close, appear in the trace.
 - Named tracks through a `perfetto.track_name` span field.
 - Slice names from `perfetto.slice_name` or OpenTelemetry's `otel.name`.
-- Span and event fields as debug annotations, and a marker filter that records only the spans and
-  events with a chosen field.
+- Span and event fields as debug annotations.
+- Per-layer filters through `Layer::with_filter`: a span that the filter rejects leaves its
+  children and events to the track of its nearest recorded ancestor.
 - A `FinishHandle` that ends the trace while the layer is still installed in a global dispatcher.
 - Complete traces from every layer: each trace carries its own process and thread descriptors, so
   several layers or successive trace files in one process all open correctly.

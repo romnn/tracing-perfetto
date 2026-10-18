@@ -43,6 +43,40 @@
 //! [`PerfettoLayer::with_span_lifetimes`] turns lifetime slices off, which leaves a synchronous
 //! program a plain flame chart per thread.
 //!
+//! # Filtering
+//!
+//! The layer records every span and event that reaches it.
+//! To record only some, give it a [per-layer filter], which leaves the other layers of the
+//! registry unaffected.
+//! A span that the filter rejects has no slices, and its children and events go on the track of
+//! its nearest recorded ancestor instead.
+//!
+//! A filter can select by target or level, or by a field that marks the spans and events to
+//! record:
+//!
+//! ```
+//! use tracing_perfetto::PerfettoLayer;
+//! use tracing_subscriber::filter::filter_fn;
+//! use tracing_subscriber::prelude::*;
+//!
+//! let layer = PerfettoLayer::new(std::io::sink)
+//!     .with_filter(filter_fn(|metadata| metadata.fields().field("perfetto").is_some()));
+//! tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+//!     // Recorded, because the span declares a `perfetto` field.
+//!     tracing::info_span!("recorded", perfetto = true).in_scope(|| {
+//!         // Not recorded, because the event declares no `perfetto` field.
+//!         tracing::info!("unmarked");
+//!     });
+//! });
+//! ```
+//!
+//! The filter reads the metadata of the span's callsite, so a declared field counts even
+//! without a value, as in `#[instrument(fields(perfetto))]`.
+//!
+//! [per-layer filter]: tracing_subscriber::Layer::with_filter
+//!
+//! # Process memory and finishing
+//!
 //! [`PerfettoLayer::with_process_memory_rss`] adds a counter track that samples the process's
 //! resident set size.
 //! A [`FinishHandle`] ends the trace while the layer is still installed, for example in a global

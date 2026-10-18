@@ -1,7 +1,5 @@
-//! Visitors that read the fields of spans and events: as debug annotations, for the naming
-//! fields, and for the marker of [`PerfettoLayer::with_filter_by_marker`].
-//!
-//! [`PerfettoLayer::with_filter_by_marker`]: crate::PerfettoLayer::with_filter_by_marker
+//! Visitors that read the fields of spans and events, as debug annotations and for the naming
+//! fields.
 
 use crate::idl;
 use tracing::field::{Field, Visit};
@@ -134,30 +132,6 @@ impl Visit for NamingFields {
     fn record_str(&mut self, field: &Field, value: &str) {
         if let Some(slot) = self.slot(field) {
             *slot = Some(value.to_string());
-        }
-    }
-}
-
-/// Returns whether any field that `record` visits has a name that `filter` accepts.
-pub(crate) fn has_marker(filter: fn(&str) -> bool, record: impl FnOnce(&mut dyn Visit)) -> bool {
-    let mut visitor = MarkerVisitor {
-        filter,
-        found: false,
-    };
-    record(&mut visitor);
-    visitor.found
-}
-
-/// Looks for a field whose name the marker filter accepts.
-struct MarkerVisitor {
-    filter: fn(&str) -> bool,
-    found: bool,
-}
-
-impl Visit for MarkerVisitor {
-    fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
-        if (self.filter)(field.name()) {
-            self.found = true;
         }
     }
 }

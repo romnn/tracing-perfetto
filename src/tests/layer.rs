@@ -8,6 +8,8 @@ use googletest::prelude::*;
 use prost::Message;
 use std::sync::Arc;
 use tracing::{field, trace_span};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
 /// One entered span reaches the output as protobuf data: a named begin and an unnamed end for
@@ -69,7 +71,9 @@ fn test_span_arguments() -> Result<()> {
     let perfetto_layer = PerfettoLayer::new(writer)
         .with_debug_annotations(true)
         .with_thread_slices(false)
-        .with_filter_by_marker(|s| s == "regular_arg");
+        .with_filter(filter_fn(|metadata| {
+            metadata.fields().field("regular_arg").is_some()
+        }));
 
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);

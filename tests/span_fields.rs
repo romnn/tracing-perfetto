@@ -1,11 +1,13 @@
-//! Span fields that name slices or mark spans for recording, read back through the public decode
-//! helper.
+//! Span fields that name slices or select spans for recording, read back through the public
+//! decode helper.
 
 use googletest::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tracing::{field, trace_span};
 use tracing_perfetto::{PerfettoLayer, decode_track_event_names};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
 /// A sink that a [`PerfettoLayer`] writes to, accumulating the trace in memory.
@@ -88,7 +90,7 @@ fn test_span_slice_name_override_uses_otel_name_when_no_track_name() -> Result<(
     Ok(())
 }
 
-/// A layer whose marker filter rejects every span writes no trace data at all.
+/// A layer whose per-layer filter rejects every span writes no trace data at all.
 ///
 /// Recording a field on a filtered span succeeds without writing anything.
 #[gtest]
@@ -97,7 +99,9 @@ fn test_span_arguments_filtered() {
     let extra_writer = writer.clone();
     let perfetto_layer = PerfettoLayer::new(writer)
         .with_debug_annotations(true)
-        .with_filter_by_marker(|s| s == "NO SUCH ARG");
+        .with_filter(filter_fn(|metadata| {
+            metadata.fields().field("NO SUCH ARG").is_some()
+        }));
 
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -112,4 +116,39 @@ fn test_span_arguments_filtered() {
     }
     let buf = extra_writer.buf.lock();
     expect_eq!(buf.len(), 0);
+}
+
+/// Spans and events selected by a field-marker filter.
+#[tracing::instrument(fields(perfetto))]
+fn marked_without_a_value() {
+    tracing::info!(perfetto = true, "marked event");
+    tracing::info!("unmarked event");
+}
+
+/// A per-layer filter on a declared field selects spans that declare it without a value.
+///
+/// `#[instrument(fields(perfetto))]` declares the field as empty, so a filter that looked for a
+/// recorded value instead of the declared field would drop the span.
+#[gtest]
+fn field_filter_selects_spans_that_declare_the_field_without_a_value() -> Result<()> {
+    let writer = TestWriter::default();
+    let output = writer.clone();
+    let perfetto_layer = PerfettoLayer::new(writer)
+        .with_thread_slices(false)
+        .with_filter(filter_fn(|metadata| {
+            metadata.fields().field("perfetto").is_some()
+        }));
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(perfetto_layer));
+
+    marked_without_a_value();
+
+    // The span's lifetime slice and the marked event are recorded, the unmarked event is not.
+    let names = decode_track_event_names(&output.buf.lock()).or_fail()?;
+    expect_that!(names, len(eq(2)));
+    expect_eq!(
+        names.first().map(String::as_str),
+        Some("marked_without_a_value")
+    );
+    Ok(())
 }

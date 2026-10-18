@@ -16,6 +16,8 @@ use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Waker};
 use tracing::instrument::{Instrument as _, WithSubscriber as _};
 use tracing::{field, trace_span};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
 /// Returns the UUID of the one thread track named after the thread `thread_name`.
@@ -760,7 +762,11 @@ fn layers_on_one_registry_keep_separate_entered_stacks() -> Result<()> {
     let second_writer = TestWriter::new();
     let second_output = second_writer.make_writer();
     let subscriber = tracing_subscriber::registry()
-        .with(PerfettoLayer::new(first_writer).with_filter_by_marker(|name| name == "first_layer"))
+        .with(
+            PerfettoLayer::new(first_writer).with_filter(filter_fn(|metadata| {
+                metadata.fields().field("first_layer").is_some()
+            })),
+        )
         .with(PerfettoLayer::new(second_writer));
     let _guard = tracing::subscriber::set_default(subscriber);
 

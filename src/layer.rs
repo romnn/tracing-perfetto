@@ -1,7 +1,7 @@
 //! The [`PerfettoLayer`], its builder methods, and the tracing callbacks that write a span or
 //! event as trace packets when the layer observes it.
 
-use crate::fields::{self, DebugAnnotations, NamingFields};
+use crate::fields::{DebugAnnotations, NamingFields};
 use crate::lifecycle::{FinishHandle, TraceLifecycle};
 use crate::packets::{self, SourceLocation, UnplacedEvent};
 use crate::process_memory::sampler::{ProcessMemorySampler, ProcessMemorySamplerConfig};
@@ -16,7 +16,6 @@ use crate::{idl, thread_track};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::field::Visit;
 use tracing::span;
 use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::Layer;
@@ -52,8 +51,6 @@ struct Config {
     debug_annotations: bool,
     span_lifetimes: bool,
     thread_slices: bool,
-    /// The marker filter, which records only spans and events with a field it accepts.
-    filter: Option<fn(&str) -> bool>,
 }
 
 impl Default for Config {
@@ -62,7 +59,6 @@ impl Default for Config {
             debug_annotations: false,
             span_lifetimes: true,
             thread_slices: true,
-            filter: None,
         }
     }
 }
@@ -70,8 +66,8 @@ impl Default for Config {
 impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// Creates a layer that writes encoded trace packets to `writer`.
     ///
-    /// Spans are recorded as lifetime and entered slices, debug annotations and the field-name
-    /// filter start disabled, and no process memory is sampled.
+    /// Spans are recorded as lifetime and entered slices, debug annotations start disabled, and
+    /// no process memory is sampled.
     #[must_use]
     pub fn new(writer: W) -> Self {
         Self {
@@ -134,40 +130,6 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self
     }
 
-    /// Records only the spans and events that have a field whose name `filter` accepts.
-    ///
-    /// The filter sees a span's fields at its creation, so a marker recorded later does not
-    /// enable the span.
-    /// Events inside a recorded span still need a marker of their own.
-    ///
-    /// ```rust
-    /// use tracing_perfetto::PerfettoLayer;
-    /// use tracing_subscriber::{layer::SubscriberExt, Registry, prelude::*};
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let file = std::fs::File::create(std::env::temp_dir().join("test.pftrace"))?;
-    /// let layer = PerfettoLayer::new(file)
-    ///     .with_filter_by_marker(|field_name| field_name == "perfetto");
-    /// tracing_subscriber::registry().with(layer).init();
-    ///
-    /// // This event is recorded, because it has a `perfetto` field.
-    /// tracing::info!(perfetto = true, my_bool = true);
-    ///
-    /// // This span is recorded, because it has a `perfetto` field.
-    /// #[tracing::instrument(fields(perfetto = true))]
-    /// fn to_instr() {
-    ///   // This event is not recorded.
-    ///   tracing::info!(my_bool = true);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use]
-    pub fn with_filter_by_marker(mut self, filter: fn(&str) -> bool) -> Self {
-        self.config.filter = Some(filter);
-        self
-    }
-
     /// Samples the process's resident set size every `interval` onto a `process.rss` counter track.
     ///
     /// The samples come from [`process_memory::default_process_memory_source`].
@@ -208,13 +170,6 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         });
         self.lifecycle.replace_sampler(sampler);
         self
-    }
-
-    /// Returns whether the layer records a span or event whose fields `record` visits.
-    fn is_recorded(&self, record: impl FnOnce(&mut dyn Visit)) -> bool {
-        self.config
-            .filter
-            .is_none_or(|filter| fields::has_marker(filter, record))
     }
 
     /// Writes `trace_packets` as one `Trace` message, unless the trace is finished.
@@ -348,9 +303,6 @@ where
         let Some(span) = ctx.span(id) else {
             return;
         };
-        if !self.is_recorded(|visitor| attrs.record(visitor)) {
-            return;
-        }
 
         let mut debug_annotations = DebugAnnotations::default();
         if self.config.debug_annotations {
@@ -402,7 +354,6 @@ where
             return;
         };
 
-        // The filter was checked in `on_new_span`, which stores state only for recorded spans.
         // Routing and naming are fixed at creation, so a late `perfetto.track_name` or
         // `perfetto.slice_name` is only an annotation.
         if let Some(states) = span.extensions_mut().get_mut::<SpanStates>()
@@ -417,10 +368,6 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        if !self.is_recorded(|visitor| event.record(visitor)) {
-            return;
-        }
-
         let metadata = event.metadata();
         let mut debug_annotations = DebugAnnotations::default();
         if self.config.debug_annotations {
