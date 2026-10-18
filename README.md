@@ -3,8 +3,7 @@
 A [`tracing`](https://docs.rs/tracing) layer that writes spans, events and process memory as a
 [Perfetto](https://perfetto.dev) trace, ready to open in the [Perfetto UI](https://ui.perfetto.dev).
 
-This crate started as a fork of [csmoe/tracing-perfetto](https://github.com/csmoe/tracing-perfetto)
-and adds:
+It provides:
 
 - A `process.rss` counter track that samples the process's resident set size, with a pluggable
   `ProcessMemorySource`.
@@ -16,6 +15,8 @@ and adds:
   or never close, appear in the trace.
 - Named tracks through a `perfetto.track_name` span field.
 - Slice names from `perfetto.slice_name` or OpenTelemetry's `otel.name`.
+- Span and event fields as debug annotations, and a marker filter that records only the spans and
+  events with a chosen field.
 - A `FinishHandle` that ends the trace while the layer is still installed in a global dispatcher.
 - Complete traces from every layer: each trace carries its own process and thread descriptors, so
   several layers or successive trace files in one process all open correctly.
@@ -78,3 +79,8 @@ and regenerates them; `task protos` regenerates them from the current `protos/`.
 MIT.
 The vendored `protos/perfetto_trace.proto` is part of Perfetto and licensed under the Apache License
 2.0; see `protos/LICENSE`.
+
+## Acknowledgements
+
+This crate grew out of [csmoe/tracing-perfetto](https://github.com/csmoe/tracing-perfetto), which
+is licensed under MIT.
