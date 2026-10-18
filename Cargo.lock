@@ -648,6 +648,7 @@ dependencies = [
  "prost",
  "rand",
  "thread-id",
+ "thread_local",
  "tokio",
  "tracing",
  "tracing-subscriber",

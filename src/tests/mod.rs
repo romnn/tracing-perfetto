@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing_subscriber::fmt::MakeWriter;
 
+mod entered_stack;
 mod layer;
 mod thread_slices;
 mod tracks;

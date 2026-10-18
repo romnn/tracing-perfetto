@@ -96,6 +96,7 @@ pub mod process_memory;
 mod sequence;
 mod span_state;
 mod thread_slices;
+mod thread_state;
 mod thread_track;
 mod writer;
 

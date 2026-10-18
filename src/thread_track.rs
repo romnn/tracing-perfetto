@@ -1,18 +1,39 @@
-//! The calling thread's track: its UUID, its descriptor with the kernel's thread ID, and which
-//! layers have described it.
+//! The calling thread's track: its UUID, its descriptor with the kernel's thread ID, and whether
+//! the thread is still recording.
 
-use crate::layer::LayerId;
 use crate::{idl, packets};
-use std::cell::RefCell;
-use std::collections::HashSet;
+use thread_local::ThreadLocal;
 
 thread_local! {
     /// The UUID of the calling thread's track, shared by every layer in the process.
     static THREAD_TRACK_UUID: u64 = packets::unique_uuid();
     /// The kernel's ID for the calling thread, read once per thread.
     static OS_THREAD_ID: i32 = os_thread_id();
-    /// The layers whose trace already describes the calling thread's track.
-    static THREAD_TRACK_DESCRIBED_BY: RefCell<HashSet<LayerId>> = RefCell::new(HashSet::new());
+    /// Alive until the calling thread's thread-local values are destroyed.
+    static LIVE_THREAD: LiveThread = LiveThread::new();
+}
+
+/// The [`ThreadLocal`] whose first use on a thread assigns the thread its [`ThreadLocal`] ID.
+static THREAD_LOCAL_ID: ThreadLocal<()> = ThreadLocal::new();
+
+/// A thread-local value whose destruction marks the start of its thread's teardown.
+struct LiveThread;
+
+impl LiveThread {
+    fn new() -> Self {
+        // `ThreadLocal` releases a thread's ID in a thread-local destructor of its own, after
+        // which a lookup on that thread panics.
+        // Assigning the ID first registers that destructor before this value's, and the standard
+        // library runs thread-local destructors in reverse order of registration, so the ID
+        // outlives this value.
+        THREAD_LOCAL_ID.get_or(|| ());
+        Self
+    }
+}
+
+impl Drop for LiveThread {
+    /// Does nothing, because only the destruction itself matters to [`live_thread_uuid`].
+    fn drop(&mut self) {}
 }
 
 /// Returns the UUID of the calling thread's track.
@@ -20,16 +41,12 @@ pub(crate) fn current_thread_uuid() -> u64 {
     THREAD_TRACK_UUID.with(|uuid| *uuid)
 }
 
-/// Marks the calling thread's track as described in the trace of `layer_id`.
+/// Returns the UUID of the calling thread's track, or `None` once the thread's teardown has
+/// begun.
 ///
-/// Returns whether this is the first time, in which case the caller writes the thread's track
-/// descriptor with the packet that first references the track.
-/// During thread teardown, when the record is gone, every call counts as the first, so a packet
-/// never refers to an undescribed track.
-pub(crate) fn first_thread_track_use(layer_id: LayerId) -> bool {
-    THREAD_TRACK_DESCRIBED_BY
-        .try_with(|layers| layers.borrow_mut().insert(layer_id))
-        .unwrap_or(true)
+/// While this returns a UUID, every [`ThreadLocal`] can be looked up on the calling thread.
+pub(crate) fn live_thread_uuid() -> Option<u64> {
+    LIVE_THREAD.try_with(|_| current_thread_uuid()).ok()
 }
 
 /// Returns the descriptor of the calling thread's track, named after the thread.

@@ -6,12 +6,27 @@
 //! child always closes before its parent, the parent's slice is then the innermost open slice on
 //! that track.
 
-use crate::layer::LayerId;
 use crate::{idl, packets};
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{Id, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::{ExtensionsMut, LookupSpan, SpanRef};
+
+/// Identifies one [`PerfettoLayer`](crate::PerfettoLayer) among all layers in the process, which
+/// selects its entry in the [`SpanStates`] of a span.
+///
+/// IDs are never reused, so an entry of a dropped layer never applies to a later layer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayerId(u64);
+
+impl LayerId {
+    /// Returns an ID that no other layer in the process has.
+    pub(crate) fn next() -> Self {
+        static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// What a [`PerfettoLayer`](crate::PerfettoLayer) keeps of a span it records.
 pub(crate) struct SpanState {

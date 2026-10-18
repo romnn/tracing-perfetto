@@ -7,12 +7,12 @@ use crate::packets::{self, create_event};
 use crate::process_memory::sampler::{ProcessMemorySampler, ProcessMemorySamplerConfig};
 use crate::process_memory::{self, ProcessMemorySource};
 use crate::sequence::TraceSequence;
-use crate::span_state::{self, LifetimeSlice, SpanPlacement, SpanState, SpanStates};
+use crate::span_state::{self, LayerId, LifetimeSlice, SpanPlacement, SpanState, SpanStates};
+use crate::thread_state::ThreadStates;
 use crate::writer::PerfettoWriter;
-use crate::{idl, thread_slices, thread_track};
+use crate::{idl, thread_track};
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::field::Visit;
 use tracing::span;
@@ -20,20 +20,6 @@ use tracing::{Event, Id, Metadata, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::{LookupSpan, SpanRef};
-
-/// Identifies one [`PerfettoLayer`] among all layers in the process.
-///
-/// IDs are never reused, so state keyed by a dropped layer's ID never applies to a later layer.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct LayerId(u64);
-
-impl LayerId {
-    /// Returns an ID that no other layer in the process has.
-    fn next() -> Self {
-        static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(0);
-        Self(NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed))
-    }
-}
 
 /// A [`Layer`] that streams spans as slices and events as instants into a Perfetto trace.
 ///
@@ -53,6 +39,7 @@ pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
     sequence: Arc<TraceSequence>,
     writer: Arc<W>,
     config: Config,
+    threads: ThreadStates,
     /// The counter track of the process-memory samples, which every sampler of the layer reuses.
     process_memory_rss_track_uuid: u64,
     lifecycle: Arc<TraceLifecycle>,
@@ -90,6 +77,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             sequence: Arc::new(TraceSequence::new()),
             writer: Arc::new(writer),
             config: Config::default(),
+            threads: ThreadStates::default(),
             process_memory_rss_track_uuid: packets::unique_uuid(),
             lifecycle: Arc::default(),
         }
@@ -255,7 +243,14 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         }
         let track_uuid = thread_track::current_thread_uuid();
         let mut trace_packets = Vec::with_capacity(events.len() + 1);
-        if thread_track::first_thread_track_use(self.layer_id) {
+
+        // During thread teardown the layer keeps no record of the description, so every use
+        // describes the track again and no packet refers to an undescribed track.
+        let first_use = self
+            .threads
+            .with_current(|thread| !std::mem::replace(&mut thread.track_described, true))
+            .unwrap_or(true);
+        if first_use {
             trace_packets.push(packets::track_descriptor_packet(
                 thread_track::current_thread_track_descriptor(),
             ));
@@ -512,7 +507,12 @@ where
             };
             self.entered_slice_begin(span.metadata(), span_state)
         };
-        if thread_slices::enter(self.layer_id, id.clone(), &begin) {
+        // During thread teardown no exit could end the slice, so the layer writes no begin.
+        let entered = self
+            .threads
+            .with_current(|thread| thread.entered.enter(id.clone(), begin.clone()))
+            .is_some();
+        if entered {
             self.write_on_thread_track(vec![begin]);
         }
     }
@@ -523,7 +523,10 @@ where
         }
         // Only the thread's own stack decides what ends, because the exiting span may be closed
         // already or entered on other threads too.
-        let events = thread_slices::exit(self.layer_id, id);
+        let events = self
+            .threads
+            .with_current(|thread| thread.entered.exit(id))
+            .unwrap_or_default();
         if !events.is_empty() {
             self.write_on_thread_track(events);
         }
