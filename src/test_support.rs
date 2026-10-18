@@ -55,6 +55,16 @@ impl std::io::Write for TestWriter {
     }
 }
 
+/// Returns a layer that records debug annotations, and a writer that shares its buffer.
+pub fn annotated_layer() -> (crate::PerfettoLayer<TestWriter>, TestWriter) {
+    let writer = TestWriter::new();
+    let output = writer.make_writer();
+    (
+        crate::PerfettoLayer::new(writer).with_debug_annotations(true),
+        output,
+    )
+}
+
 /// Decodes everything written to `writer` so far as one trace.
 pub fn decode(writer: &TestWriter) -> Result<idl::Trace> {
     idl::Trace::decode(writer.buf.lock().as_slice()).or_fail()
@@ -101,6 +111,13 @@ pub fn events_of_type(
 pub fn event_name(event: &idl::TrackEvent) -> Option<&str> {
     match &event.name_field {
         Some(track_event::NameField::Name(name)) => Some(name),
+        _ => None,
+    }
+}
+
+pub fn correlation_id(event: &idl::TrackEvent) -> Option<u64> {
+    match event.correlation_id_field {
+        Some(track_event::CorrelationIdField::CorrelationId(id)) => Some(id),
         _ => None,
     }
 }
@@ -199,6 +216,7 @@ pub fn close_labeled(span: tracing::Span, name: &str) {
 }
 
 /// A slice reconstructed by replaying the begins and ends on its track.
+#[derive(Debug)]
 pub struct ReplayedSlice {
     pub name: String,
     pub track_uuid: u64,
@@ -206,6 +224,10 @@ pub struct ReplayedSlice {
     pub depth: usize,
     pub begin_timestamp: u64,
     pub begin_annotations: Vec<idl::DebugAnnotation>,
+    /// The correlation ID of the slice's begin.
+    pub correlation_id: Option<u64>,
+    /// Whether the slice's begin names a source location.
+    pub has_source_location: bool,
     /// The timestamp of the slice's end, or `None` while the slice is open.
     pub end_timestamp: Option<u64>,
     pub end_annotations: Vec<idl::DebugAnnotation>,
@@ -248,6 +270,8 @@ pub fn replay_slices(trace: &idl::Trace) -> Result<Vec<ReplayedSlice>> {
                 depth: stack.len() - 1,
                 begin_timestamp: timestamp,
                 begin_annotations: event.debug_annotations.clone(),
+                correlation_id: correlation_id(event),
+                has_source_location: event.source_location_field.is_some(),
                 end_timestamp: None,
                 end_annotations: Vec::new(),
             });
@@ -275,6 +299,16 @@ pub fn replay_slices(trace: &idl::Trace) -> Result<Vec<ReplayedSlice>> {
         slice.end_timestamp = Some(timestamp);
         slice.end_annotations = event.debug_annotations.clone();
     }
+    Ok(slices)
+}
+
+/// Replays the slices of every track like [`replay_slices`] and returns those on span tracks.
+///
+/// Entered slices on thread tracks are checked for valid stacks too, but left out.
+pub fn replay_lifetime_slices(trace: &idl::Trace) -> Result<Vec<ReplayedSlice>> {
+    let thread_tracks = thread_track_uuids(trace);
+    let mut slices = replay_slices(trace)?;
+    slices.retain(|slice| !thread_tracks.contains(&slice.track_uuid));
     Ok(slices)
 }
 

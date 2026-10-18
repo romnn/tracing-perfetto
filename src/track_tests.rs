@@ -5,9 +5,10 @@ use crate::PerfettoLayer;
 use crate::idl;
 use crate::idl::track_event;
 use crate::test_support::{
-    ReplayedSlice, TestWriter, annotation_names, close_labeled, decode, decode_writes,
-    events_of_type, instant_marked, replay_slices, slice_named, span_track_descriptors,
-    thread_track_uuids, track_descriptor, track_event, track_name,
+    ReplayedSlice, TestWriter, annotated_layer, annotation_names, close_labeled, decode,
+    decode_writes, events_of_type, instant_marked, replay_lifetime_slices, replay_slices,
+    slice_named, span_track_descriptors, thread_track_uuids, track_descriptor, track_event,
+    track_name,
 };
 use googletest::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -15,16 +16,6 @@ use std::sync::Arc;
 use tracing::instrument::{Instrument as _, WithSubscriber as _};
 use tracing::{field, trace_span};
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
-
-/// Returns a layer that records debug annotations, and a writer that shares its buffer.
-fn annotated_layer() -> (PerfettoLayer<TestWriter>, TestWriter) {
-    let writer = TestWriter::new();
-    let output = writer.make_writer();
-    (
-        PerfettoLayer::new(writer).with_debug_annotations(true),
-        output,
-    )
-}
 
 /// Returns the UUID of the one span track named `name`.
 fn span_track_named(trace: &idl::Trace, name: &str) -> Result<u64> {
@@ -77,7 +68,7 @@ fn overlapping_spans_with_one_track_name_get_distinct_tracks() -> Result<()> {
     close_labeled(second, "second");
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     expect_that!(
         ended_slice_names(&slices),
         unordered_elements_are![eq(&"first"), eq(&"second")]
@@ -133,7 +124,7 @@ fn sequential_children_nest_on_the_parent_track() -> Result<()> {
     close_labeled(root, "root");
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
 
     // The root span's track, named after it, is the only span track.
     let root_track = span_track_named(&trace, "root")?;
@@ -192,7 +183,7 @@ fn overlapping_children_get_a_sub_track_of_the_parent_track() -> Result<()> {
     close_labeled(root, "root");
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     expect_that!(ended_slice_names(&slices), len(eq(4)));
 
     // The overlapping child's track is named after it and sits below the parent's track.
@@ -230,7 +221,7 @@ fn span_closed_on_another_thread_ends_on_its_lifetime_track() -> Result<()> {
         .or_fail()?;
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     let moved = slice_named(&slices, "moved")?;
     expect_eq!(moved.track_uuid, span_track_named(&trace, "moved")?);
     expect_true!(moved.end_timestamp.is_some());
@@ -258,22 +249,22 @@ fn begin_and_span_events_are_written_while_the_span_is_open() -> Result<()> {
 
     // Before the close, the begin and the event are written and the slice is still open.
     let open_trace = decode(&output)?;
-    let open_slices = replay_slices(&open_trace)?;
+    let open_slices = replay_lifetime_slices(&open_trace)?;
     let open = slice_named(&open_slices, "open")?;
     expect_eq!(open.end_timestamp, None);
     let inside = instant_marked(&open_trace, "inside")?;
     expect_eq!(inside.event.track_uuid, Some(open.track_uuid));
 
-    // The close adds only the end.
+    // The exit adds only the entered slice's end, and the close only the lifetime slice's end.
     drop(entered);
     drop(span);
     let closed_trace = decode(&output)?;
-    let closed = slice_named(&replay_slices(&closed_trace)?, "open")?.end_timestamp;
+    let closed = slice_named(&replay_lifetime_slices(&closed_trace)?, "open")?.end_timestamp;
     expect_true!(closed.is_some());
     expect_eq!(
         closed_trace.packet.len(),
-        open_trace.packet.len() + 1,
-        "expected only the slice end to follow the close"
+        open_trace.packet.len() + 2,
+        "expected only the two slice ends to follow the exit and close"
     );
     Ok(())
 }
@@ -292,7 +283,7 @@ fn span_that_never_closes_keeps_its_begin() -> Result<()> {
     drop(guard);
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     let leaked = slice_named(&slices, "leaked")?;
     expect_eq!(leaked.end_timestamp, None);
     expect_eq!(
@@ -314,7 +305,7 @@ fn events_in_a_span_are_instants_on_its_track() -> Result<()> {
     trace_span!("scope").in_scope(|| tracing::info!(marker = "inside"));
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     let scope = slice_named(&slices, "scope")?;
     let inside = instant_marked(&trace, "inside")?;
     expect_eq!(inside.event.track_uuid, Some(scope.track_uuid));
@@ -336,7 +327,7 @@ fn events_with_an_explicit_parent_go_to_the_parent_track() -> Result<()> {
     drop(target);
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     let explicit = instant_marked(&trace, "explicit")?;
     expect_eq!(
         explicit.event.track_uuid,
@@ -389,7 +380,7 @@ fn recorded_fields_are_annotations_on_the_end() -> Result<()> {
     drop(span);
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     let recorded = slice_named(&slices, "recorded")?;
     expect_eq!(annotation_names(&recorded.begin_annotations), ["initial"]);
     expect_eq!(annotation_names(&recorded.end_annotations), ["late"]);
@@ -449,7 +440,7 @@ fn late_track_name_does_not_move_the_span() -> Result<()> {
     drop(span);
 
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
 
     // The only span track keeps the span's own name.
     let early_track = span_track_named(&trace, "early")?;
@@ -559,7 +550,8 @@ fn each_track_is_described_once_with_its_first_use() -> Result<()> {
     Ok(())
 }
 
-/// With span lifetimes disabled, spans write no slices and their events go to the thread track.
+/// With span lifetimes and thread slices disabled, spans write no slices and their events go to
+/// the thread track.
 ///
 /// The option exists to drop the per-span tracks, which duplicate the thread's flame chart in
 /// synchronous programs.
@@ -567,9 +559,11 @@ fn each_track_is_described_once_with_its_first_use() -> Result<()> {
 fn disabled_span_lifetimes_write_no_slices() -> Result<()> {
     let writer = TestWriter::new();
     let output = writer.make_writer();
+    // Entered slices are left out too, so that any slice would come from a span lifetime.
     let layer = PerfettoLayer::new(writer)
         .with_debug_annotations(true)
-        .with_span_lifetimes(false);
+        .with_span_lifetimes(false)
+        .with_thread_slices(false);
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
     let root = trace_span!(
@@ -668,7 +662,7 @@ fn concurrent_tasks_with_one_track_name_keep_every_track_nested() -> Result<()> 
 
     // Every end closes the innermost open slice of its own name on its own track.
     let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
+    let slices = replay_lifetime_slices(&trace)?;
     expect_that!(ended_slice_names(&slices), len(eq(4 * TASKS)));
 
     // Every task has its own "jobs" track, and its second concurrent child a sub-track of it.
