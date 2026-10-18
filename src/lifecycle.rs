@@ -51,8 +51,18 @@ impl TraceLifecycle {
 ///
 /// A layer inside a process-global dispatcher is never dropped, so its owner finishes the trace
 /// through this handle instead.
+/// Clones finish the same trace.
+#[derive(Clone)]
 pub struct FinishHandle {
     lifecycle: Arc<TraceLifecycle>,
+}
+
+impl std::fmt::Debug for FinishHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinishHandle")
+            .field("finished", &self.lifecycle.is_finished())
+            .finish()
+    }
 }
 
 impl FinishHandle {

@@ -196,3 +196,26 @@ fn finish_handle_ends_the_trace_of_a_live_layer() {
     );
     expect_eq!(extra_writer.buf.lock().len(), written);
 }
+
+/// A clone of a finish handle finishes the same trace, and both report it as finished.
+///
+/// A clone with a lifecycle of its own would leave the layer writing after the clone's owner
+/// finished it.
+#[gtest]
+fn cloned_finish_handle_finishes_the_same_trace() {
+    let writer = TestWriter::new();
+    let output = writer.make_writer();
+    let perfetto_layer = PerfettoLayer::new(writer);
+    let finish = perfetto_layer.finish_handle();
+    let cloned = finish.clone();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(perfetto_layer));
+
+    expect_eq!(format!("{finish:?}"), "FinishHandle { finished: false }");
+    cloned.finish();
+    let written = output.buf.lock().len();
+    trace_span!("after_finish").in_scope(|| {});
+
+    expect_eq!(output.buf.lock().len(), written);
+    expect_eq!(format!("{finish:?}"), "FinishHandle { finished: true }");
+}
