@@ -8,7 +8,11 @@ and adds:
 
 - A `process.rss` counter track that samples the process's resident set size, with a pluggable
   `ProcessMemorySource`.
-- Named tracks through a `perfetto.track_name` span field, inherited by child spans.
+- A track model for concurrent code: every root span gets its own track, sequential children
+  nest on their parent's track, and overlapping children get sub-tracks, so slices always nest.
+- Streaming: slice begins and events are written as they happen, so spans that are still open,
+  or never close, appear in the trace.
+- Named tracks through a `perfetto.track_name` span field.
 - Slice names from `perfetto.slice_name` or OpenTelemetry's `otel.name`.
 - A `FinishHandle` that ends the trace while the layer is still installed in a global dispatcher.
 - Complete traces from every layer: each trace carries its own process and thread descriptors, so
@@ -39,6 +43,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Tracks
+
+In the Perfetto UI, spans and events appear on these tracks below the process:
+
+- Each root span has a track named after the span, or after its `perfetto.track_name` field.
+  Tracks of the same name merge into one visual track with a lane for each span open at the same
+  time, so 50 concurrent `handle` tasks show as one `handle` track with up to 50 lanes.
+- A child span nests beneath its parent's slice on the parent's track.
+  A child that overlaps an open sibling, as with `join!`, moves to a sub-track named after it.
+- Events inside a span are instants on the span's track; other events are instants on the
+  recording thread's track.
+
+`with_span_lifetimes(false)` turns span slices off and leaves only the events.
 
 ## Development
 

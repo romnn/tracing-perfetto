@@ -1,4 +1,5 @@
-//! Traces nested spans on several OS threads into `test.pftrace` in the temporary directory.
+//! Traces nested spans on several OS threads into `threads_example.pftrace` in the temporary
+//! directory.
 
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use tracing_subscriber::{Registry, fmt, layer::SubscriberExt};
 const STEP: Duration = Duration::from_millis(250);
 
 fn init_subscriber() -> Result<(), Box<dyn std::error::Error>> {
-    let trace_path = std::env::temp_dir().join("test.pftrace");
+    let trace_path = std::env::temp_dir().join("threads_example.pftrace");
     let trace_file = std::fs::File::create(&trace_path)?;
     let perfetto_layer =
         PerfettoLayer::new(std::sync::Mutex::new(trace_file)).with_debug_annotations(true);
