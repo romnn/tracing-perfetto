@@ -1,0 +1,71 @@
+[package]
+name = "tracing-perfetto"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "A tracing layer that records spans, events and process memory as Perfetto traces"
+repository = "https://github.com/romnn/tracing-perfetto"
+readme = "README.md"
+keywords = ["tracing", "perfetto", "profiling", "trace"]
+categories = ["development-tools::profiling", "development-tools::debugging"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.11"
+chrono = "0.4"
+memory-stats = "1.2"
+parking_lot = "0.12"
+prost = "0.14"
+rand = "0.10"
+thread-id = "5"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[dev-dependencies]
+googletest = "0.14"
+tokio = { version = "1.53", features = ["full"] }
+
+[workspace]
+members = ["codegen"]
+
+[workspace.metadata.cargo-fc]
+install_missing_targets = true
+dedupe = true
+aggregate_targets = false
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-gnu",
+  "aarch64-apple-darwin",
+]
+
+[workspace.metadata.cargo-fc.subcommands.udeps]
+maximal_features = true
+
+[workspace.lints.rust]
+warnings = { level = "warn", priority = -1 }
+unsafe_code = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+missing_errors_doc = "warn"
+await_holding_lock = "deny"
+allow_attributes_without_reason = "deny" # every #[allow] must carry reason = "..."
+
+# Allowed
+map_unwrap_or = "allow"
+assigning_clones = "allow"
+struct_excessive_bools = "allow"

@@ -1,0 +1,120 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+vars:
+  # The Perfetto release whose trace proto `task protos:update` fetches.
+  PERFETTO_VERSION: v53.0
+
+tasks:
+  default:
+    cmds:
+      - task --list-all
+
+  format:
+    cmds:
+      - cargo fmt --all {{.CLI_ARGS}}
+
+  check:
+    cmds:
+      - cargo check --workspace --all-targets {{.CLI_ARGS}}
+
+  check:fc:
+    cmds:
+      - cargo fc check --all-targets {{.CLI_ARGS}}
+
+  test:
+    cmds:
+      - cargo nextest run -P default --workspace --all-targets --no-tests warn {{.CLI_ARGS}}
+
+  test:fc:
+    cmds:
+      - cargo fc nextest run -P default --all-targets --no-tests warn {{.CLI_ARGS}}
+
+  test:doc:
+    cmds:
+      - cargo test --doc --workspace {{.CLI_ARGS}}
+
+  lint:
+    cmds:
+      - cargo lint --workspace --all-features {{.CLI_ARGS}}
+
+  lint:fc:
+    cmds:
+      - cargo fc lint {{.CLI_ARGS}}
+
+  lint:fix:
+    aliases: [fix]
+    cmds:
+      - cargo fixit --workspace --all-features {{.CLI_ARGS}}
+
+  lint:actions:
+    cmds:
+      - actionlint {{.CLI_ARGS}}
+
+  audit:
+    cmds:
+      - cargo audit {{.CLI_ARGS}}
+
+  unused:
+    aliases: [unused-dependencies]
+    cmds:
+      - cargo +nightly fc udeps --maximal-features --all-targets {{.CLI_ARGS}}
+
+  typos:
+    aliases: [spellcheck]
+    cmds:
+      - typos {{.CLI_ARGS}}
+
+  build:
+    cmds:
+      - cargo build --all-targets {{.CLI_ARGS}}
+
+  build:release:
+    cmds:
+      - cargo build --all-targets --release {{.CLI_ARGS}}
+
+  protos:
+    desc: "regenerate the committed bindings in src/generated/ from protos/"
+    cmds:
+      - cargo run -p codegen
+      - cargo fmt --all
+
+  protos:update:
+    desc: "fetch the trace proto of PERFETTO_VERSION and regenerate the bindings"
+    cmds:
+      - >-
+        curl -fsSL -o protos/perfetto_trace.proto
+        https://raw.githubusercontent.com/google/perfetto/{{.PERFETTO_VERSION}}/protos/perfetto/trace/perfetto_trace.proto
+      - >-
+        curl -fsSL -o protos/LICENSE
+        https://raw.githubusercontent.com/google/perfetto/{{.PERFETTO_VERSION}}/LICENSE
+      - task: protos
+
+  outdated:
+    desc: "list outdated deps (incl. new majors): adoptable now vs still in cooldown"
+    cmds:
+      - "cooldown outdated --sync {{.CLI_ARGS}}"
+
+  outdated:minor:
+    desc: "list outdated deps within the current major only"
+    cmds:
+      - "cooldown outdated --no-major --sync {{.CLI_ARGS}}"
+
+  upgrade:
+    desc: "upgrade all deps incl. cross-major bumps, within the cooldown"
+    aliases: [update]
+    cmds:
+      - "cooldown upgrade --major --sync {{.CLI_ARGS}}"
+
+  upgrade:minor:
+    desc: "upgrade all deps within their current major, within the cooldown"
+    cmds:
+      - "cooldown upgrade --no-major --sync {{.CLI_ARGS}}"
+
+  upgrade:latest:
+    desc: "upgrade ignoring the cooldown window — use deliberately"
+    prompt:
+      - "DANGER: this bypasses the supply-chain cooldown and adopts brand-new (possibly
+        compromised) releases. Prefer 'task upgrade' / 'task upgrade:minor'. Continue?"
+    cmds:
+      - "cooldown upgrade --latest {{.CLI_ARGS}}"
