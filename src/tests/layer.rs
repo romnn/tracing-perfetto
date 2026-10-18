@@ -10,8 +10,8 @@ use std::sync::Arc;
 use tracing::{field, trace_span};
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
-// Check that we are able to write a span and confirm that it's written as protobuf data to the
-// output
+/// One entered span reaches the output as protobuf data: a named begin and an unnamed end for
+/// each of its lifetime and entered slices.
 #[gtest]
 fn test_simple_span() -> Result<()> {
     let writer = TestWriter::new();
@@ -30,7 +30,7 @@ fn test_simple_span() -> Result<()> {
     let mut track_events_seen = 0;
     let mut saw_slice_begin = false;
     let mut saw_slice_end = false;
-    // Depending on test ordering, we may or may not see a process descriptor
+    // Count only track events, skipping the preamble and the track descriptors.
     for packet in trace.packet {
         let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data else {
             continue;
@@ -58,7 +58,8 @@ fn test_simple_span() -> Result<()> {
     Ok(())
 }
 
-// Check that we are able to write arguments to a span correctly
+/// A span's arguments are written correctly: creation fields on the begin and recorded fields
+/// on the end.
 #[gtest]
 fn test_span_arguments() -> Result<()> {
     let writer = TestWriter::new();
@@ -88,7 +89,7 @@ fn test_span_arguments() -> Result<()> {
     let mut track_events_seen = 0;
     let mut saw_slice_begin = false;
     let mut saw_slice_end = false;
-    // Depending on test ordering, we may or may not see a process descriptor
+    // Count only track events, skipping the preamble and the track descriptors.
     for packet in trace.packet {
         let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data else {
             continue;
@@ -151,6 +152,7 @@ fn test_span_arguments() -> Result<()> {
     Ok(())
 }
 
+/// A memory source that always reports 1 KiB.
 struct FixedProcessMemory;
 
 impl crate::process_memory::ProcessMemorySource for FixedProcessMemory {
@@ -159,8 +161,9 @@ impl crate::process_memory::ProcessMemorySource for FixedProcessMemory {
     }
 }
 
-/// Finishing through the handle ends the trace while the layer stays installed: the sampler
-/// thread is joined and later spans are not written.
+/// Finishing through the handle ends the trace while the layer stays installed.
+///
+/// The sampler thread is joined and later spans are not written.
 #[gtest]
 fn finish_handle_ends_the_trace_of_a_live_layer() {
     let writer = TestWriter::new();

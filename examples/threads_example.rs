@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(STEP);
     let mut join_handles = Vec::new();
 
-    // threads with default track id
+    // Threads whose root spans get tracks named after the span
     for i in 0..3 {
         let jh = std::thread::spawn(move || {
             let _guard = span!(tracing::Level::INFO, "thread", i).entered();
@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         join_handles.push(jh);
     }
 
+    // Threads whose root spans name their own tracks
     for i in 0..3 {
         let jh = std::thread::spawn(move || {
             let _guard = span!(

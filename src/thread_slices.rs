@@ -29,6 +29,7 @@ struct EnteredFrame {
 }
 
 impl EnteredFrame {
+    /// Builds the end of the frame's slice, which carries no name, location or annotations.
     fn end(&self) -> idl::TrackEvent {
         packets::create_event(
             self.begin.track_uuid(),

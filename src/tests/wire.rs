@@ -61,6 +61,7 @@ fn is_counter_event(packet: &idl::TracePacket) -> bool {
     )
 }
 
+/// Returns the trusted packet sequence that `packet` names, if any.
 fn sequence_id(packet: &idl::TracePacket) -> Option<u32> {
     let idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(id) =
         packet.optional_trusted_packet_sequence_id?;
@@ -174,14 +175,18 @@ fn record_on_current_thread(
     Ok(kernel_thread_id)
 }
 
-fn new_announcing_layer(
-    writer: TestWriter,
-    armed: bool,
-) -> (
-    PerfettoLayer<TestWriter>,
-    Arc<AtomicBool>,
-    mpsc::Receiver<()>,
-) {
+/// A layer that samples an [`AnnouncingProcessMemory`], with the handles that drive the sampler.
+struct AnnouncingLayer {
+    layer: PerfettoLayer<TestWriter>,
+    /// Arms the memory source, which reports no samples until then.
+    armed: Arc<AtomicBool>,
+    /// Receives one announcement per sample the memory source reports.
+    announcements: mpsc::Receiver<()>,
+}
+
+/// Returns a layer writing to `writer` whose sampler polls an announcing memory source without
+/// pause, armed from the start if `armed` is set.
+fn new_announcing_layer(writer: TestWriter, armed: bool) -> AnnouncingLayer {
     let armed = Arc::new(AtomicBool::new(armed));
     let (announcements_sender, announcements) = mpsc::channel();
     let layer = PerfettoLayer::new(writer).with_process_memory_source(
@@ -191,7 +196,11 @@ fn new_announcing_layer(
             announcements: announcements_sender,
         }),
     );
-    (layer, armed, announcements)
+    AnnouncingLayer {
+        layer,
+        armed,
+        announcements,
+    }
 }
 
 /// Thread descriptors carry each thread's own OS thread ID.
@@ -271,7 +280,11 @@ fn thread_descriptors_carry_the_os_thread_id_of_each_thread() -> Result<()> {
 fn packets_of_one_layer_share_one_valid_sequence_id() -> Result<()> {
     let writer = TestWriter::new();
     let extra_writer = writer.make_writer();
-    let (perfetto_layer, _, announcements) = new_announcing_layer(writer, true);
+    let AnnouncingLayer {
+        layer: perfetto_layer,
+        announcements,
+        ..
+    } = new_announcing_layer(writer, true);
     let finish = perfetto_layer.finish_handle();
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -363,7 +376,11 @@ fn two_layers_on_one_registry_each_write_a_complete_trace() -> Result<()> {
 fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
     let writer = TestWriter::new();
     let extra_writer = writer.make_writer();
-    let (perfetto_layer, _, announcements) = new_announcing_layer(writer, true);
+    let AnnouncingLayer {
+        layer: perfetto_layer,
+        announcements,
+        ..
+    } = new_announcing_layer(writer, true);
     let finish = perfetto_layer.finish_handle();
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -510,7 +527,11 @@ fn preamble_is_written_once_across_many_writes() -> Result<()> {
 fn preamble_precedes_a_memory_sample_written_first() -> Result<()> {
     let writer = TestWriter::new();
     let extra_writer = writer.make_writer();
-    let (perfetto_layer, _, announcements) = new_announcing_layer(writer, true);
+    let AnnouncingLayer {
+        layer: perfetto_layer,
+        announcements,
+        ..
+    } = new_announcing_layer(writer, true);
     let finish = perfetto_layer.finish_handle();
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -540,7 +561,11 @@ fn preamble_precedes_a_memory_sample_written_first() -> Result<()> {
 fn preamble_precedes_a_span_written_first() -> Result<()> {
     let writer = TestWriter::new();
     let extra_writer = writer.make_writer();
-    let (perfetto_layer, armed, announcements) = new_announcing_layer(writer, false);
+    let AnnouncingLayer {
+        layer: perfetto_layer,
+        armed,
+        announcements,
+    } = new_announcing_layer(writer, false);
     let finish = perfetto_layer.finish_handle();
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -567,7 +592,11 @@ fn concurrent_first_writes_all_follow_the_preamble() -> Result<()> {
     const THREADS: usize = 8;
     let writer = TestWriter::new();
     let extra_writer = writer.make_writer();
-    let (perfetto_layer, armed, announcements) = new_announcing_layer(writer, false);
+    let AnnouncingLayer {
+        layer: perfetto_layer,
+        armed,
+        announcements,
+    } = new_announcing_layer(writer, false);
     let finish = perfetto_layer.finish_handle();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(perfetto_layer));
 

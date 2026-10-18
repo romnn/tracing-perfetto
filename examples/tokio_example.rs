@@ -34,11 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut join_handles = Vec::new();
 
-    // example 1: instrument async handler chain with a dedicated span
+    // Instrument each async task with a dedicated span.
     // The tasks share one track name, so the trace viewer shows them as lanes of one track.
     for i in 0..5 {
         let task = async move {
-            // info!("task ${i} started");
             tokio::time::sleep(STEP).await;
             for j in 0..3 {
                 let _span = span!(tracing::Level::INFO, "loop", i, j);
@@ -61,10 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         join_handles.push(jh);
     }
 
-    // example 2: attach an async handler chain to the current entered span
-    // this can be useful if we spawn a task but do not want to create a new span for it
-    // but to attach it to the current active span
-    // (or do not have a span to attach to)
+    // Attach each async task to the span entered around its spawn.
+    // This suits a task that should not get a span of its own, and works without an entered span
+    // too.
     for i in 5..10 {
         let task = async move {
             info!("task ${i} started");
@@ -86,9 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             perfetto.track_name = format!("task track {}", i)
         )
         .entered();
-        // do some work on the span
+        // Do some work on the span.
         let jh = tokio::spawn(task.in_current_span());
-        // do some work on the span
+        // Do some work on the span.
         join_handles.push(jh);
     }
 

@@ -34,6 +34,9 @@ impl std::io::Write for TestWriter {
     }
 }
 
+/// A span with both `perfetto.track_name` and `otel.name` takes its slice name from `otel.name`.
+///
+/// The track name names only the span's track, so its slices keep a name of their own.
 #[gtest]
 fn test_span_slice_name_override_prefers_perfetto_track_name() -> Result<()> {
     let writer = TestWriter::default();
@@ -61,6 +64,7 @@ fn test_span_slice_name_override_prefers_perfetto_track_name() -> Result<()> {
     Ok(())
 }
 
+/// A span with `otel.name` and no track name takes its slice name from `otel.name`.
 #[gtest]
 fn test_span_slice_name_override_uses_otel_name_when_no_track_name() -> Result<()> {
     let writer = TestWriter::default();
@@ -84,8 +88,9 @@ fn test_span_slice_name_override_uses_otel_name_when_no_track_name() -> Result<(
     Ok(())
 }
 
-// If all our spans are filtered, we shouldn't get any trace data at all.
-// Doing a `.record` on a span should also "fail successfully".
+/// A layer whose marker filter rejects every span writes no trace data at all.
+///
+/// Recording a field on a filtered span succeeds without writing anything.
 #[gtest]
 fn test_span_arguments_filtered() {
     let writer = TestWriter::default();

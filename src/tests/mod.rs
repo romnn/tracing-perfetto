@@ -55,7 +55,7 @@ impl std::io::Write for TestWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // There's nothing to flush, we always immediately append to the buffer.
+        // Writes append to the buffer immediately, so there is nothing to flush.
         std::io::Result::Ok(())
     }
 }
