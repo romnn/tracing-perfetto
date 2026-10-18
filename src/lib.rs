@@ -1,20 +1,28 @@
 //! A [`tracing_subscriber::Layer`] that writes spans and events as a [Perfetto] trace.
 //!
-//! [`PerfettoLayer`] records each span as a slice from its creation to its close, and each event
-//! as an instant.
+//! [`PerfettoLayer`] records each span as a lifetime slice from its creation to its close, each
+//! entry of a span as an entered slice on the entering thread's track, and each event as an
+//! instant.
 //! It streams them as encoded `Trace` protobuf packets to a [`PerfettoWriter`] as they happen, so
 //! a slice's begin is in the trace while the span is still open.
 //! Open the output in the [Perfetto UI].
 //!
 //! # Tracks
 //!
-//! Every root span gets its own track below the process track, named after the span.
+//! Every root span gets its own track below the process track, named after the span, which holds
+//! its lifetime slice.
 //! A child span nests on its parent's track, unless another child of that parent is still open
 //! there.
 //! A child that overlaps such a sibling gets a sub-track of its parent's track, named after the
 //! child.
 //! An event inside a span is an instant on that span's track, and any other event is an instant
 //! on the track of the thread that records it.
+//!
+//! Each thread's track shows where spans actually ran: every entry of a span is a slice from
+//! the enter to the exit, so each poll of an instrumented future is one slice on the worker that
+//! polled it.
+//! A span's entered slices and its lifetime slice share a `correlation_id` of the span's own, which
+//! links them across threads.
 //!
 //! The Perfetto UI merges tracks of the same name into one visual track, with a lane for each
 //! span that is open at the same time.
@@ -30,7 +38,10 @@
 //!   then to the span's name.
 //!
 //! Recording either field later leaves the slice where it is.
-//! [`PerfettoLayer::with_span_lifetimes`] turns span slices off, which leaves only the events.
+//!
+//! [`PerfettoLayer::with_thread_slices`] turns entered slices off.
+//! [`PerfettoLayer::with_span_lifetimes`] turns lifetime slices off, which leaves a synchronous
+//! program a plain flame chart per thread.
 //!
 //! [`PerfettoLayer::with_process_memory_rss`] adds a counter track that samples the process's
 //! resident set size.
@@ -66,12 +77,14 @@ use bytes::BytesMut;
 use idl_helpers::{DebugAnnotations, create_event, current_thread_uuid};
 use prost::Message;
 use sequence::TraceSequence;
+use std::borrow::Cow;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::Event;
 use tracing::Id;
+use tracing::Metadata;
 use tracing::Subscriber;
 use tracing::field::Field;
 use tracing::field::Visit;
@@ -100,12 +113,38 @@ mod sequence;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+mod thread_slice_tests;
+mod thread_slices;
+#[cfg(test)]
 mod track_tests;
 
 pub mod process_memory;
 
-/// The lifetime slice of a span that a [`PerfettoLayer`] has begun and not yet ended.
+/// What a [`PerfettoLayer`] keeps of a span it records.
 struct PerfettoSpanState {
+    /// The name of the span's lifetime slice and of its entered slices.
+    slice_name: Cow<'static, str>,
+    /// The ID that links the span's entered slices to each other and to its lifetime slice.
+    ///
+    /// It is random and the span's own, so it never links a span to a parent whose track it
+    /// shares.
+    correlation_id: u64,
+    /// The span's lifetime slice, if span lifetimes are recorded.
+    lifetime: Option<LifetimeSlice>,
+    /// The fields given at the span's creation, written on each entered slice's begin.
+    ///
+    /// This stays empty while span lifetimes are recorded, because the lifetime slice's begin
+    /// carries these fields instead.
+    creation_annotations: Vec<idl::DebugAnnotation>,
+    /// The fields recorded after the span's creation.
+    ///
+    /// They are written on the lifetime slice's end, or, without span lifetimes, on the begin of
+    /// each slice entered after the record.
+    recorded_annotations: Vec<idl::DebugAnnotation>,
+}
+
+/// The lifetime slice of a span that a [`PerfettoLayer`] has begun and not yet ended.
+struct LifetimeSlice {
     /// The track that holds the span's slice.
     track_uuid: u64,
     /// The number of the span's open children whose slices nest on the span's track.
@@ -117,8 +156,6 @@ struct PerfettoSpanState {
     ///
     /// This span holds one count of that span's `open_children_on_track` until it closes.
     track_parent: Option<Id>,
-    /// The fields recorded after the span's creation, written on its slice's end.
-    recorded_annotations: Vec<idl::DebugAnnotation>,
 }
 
 /// Where a new span's slice goes.
@@ -214,8 +251,10 @@ impl LayerId {
 
 /// A [`Layer`] that streams spans as slices and events as instants into a Perfetto trace.
 ///
-/// A span's slice begins when the span is created and ends when it closes, whichever thread
-/// closes it, on a track chosen as the [crate documentation](crate#tracks) describes.
+/// A span's lifetime slice begins when the span is created and ends when it closes, whichever
+/// thread closes it, on a track chosen as the [crate documentation](crate#tracks) describes.
+/// Each time a thread enters the span, an entered slice runs on that thread's track until the
+/// span exits, so each poll of an instrumented future is one slice on the worker that ran it.
 /// Every packet is written when the layer observes it, so a trace cut short still holds every
 /// slice begun so far.
 ///
@@ -329,6 +368,7 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoWriter for W {
 struct Config {
     debug_annotations: bool,
     span_lifetimes: bool,
+    thread_slices: bool,
     filter: Option<fn(&str) -> bool>,
 }
 
@@ -337,6 +377,7 @@ impl Default for Config {
         Self {
             debug_annotations: false,
             span_lifetimes: true,
+            thread_slices: true,
             filter: None,
         }
     }
@@ -345,8 +386,8 @@ impl Default for Config {
 impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// Creates a layer that writes encoded trace packets to `writer`.
     ///
-    /// Spans are recorded as slices, debug annotations and the field-name filter start
-    /// disabled, and no process memory is sampled.
+    /// Spans are recorded as lifetime and entered slices, debug annotations and the field-name
+    /// filter start disabled, and no process memory is sampled.
     #[must_use]
     pub fn new(writer: W) -> Self {
         Self {
@@ -378,11 +419,29 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// Configures whether spans are recorded as slices from their creation to their close.
     ///
     /// Enabled by default.
-    /// When disabled, spans write nothing and every event is an instant on the track of the
-    /// thread that records it.
+    /// When disabled, spans get no tracks of their own and every event is an instant on the
+    /// track of the thread that records it.
+    /// Entered slices then carry the span's fields and source location, and with
+    /// [`Self::with_thread_slices`] left on, a synchronous program gets a plain flame chart per
+    /// thread.
     #[must_use]
     pub fn with_span_lifetimes(mut self, value: bool) -> Self {
         self.config.span_lifetimes = value;
+        self
+    }
+
+    /// Configures whether spans are recorded as slices on the tracks of the threads that enter
+    /// them.
+    ///
+    /// Enabled by default.
+    /// Each entry of a span, such as one poll of an instrumented future, is a slice from the
+    /// enter to the exit on the entering thread's track.
+    /// Every entered slice of a span carries the span's own `correlation_id`, as its lifetime
+    /// slice does, so the Perfetto UI can link exactly that span's slices across threads.
+    /// When disabled, thread tracks hold only events.
+    #[must_use]
+    pub fn with_thread_slices(mut self, value: bool) -> Self {
+        self.config.thread_slices = value;
         self
     }
 
@@ -480,28 +539,112 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             .write(self.writer.as_ref(), &idl::Trace { packet: packets });
     }
 
-    /// Writes `event` on the calling thread's track, which is described on its first use.
-    fn write_on_thread_track(&self, mut event: idl::TrackEvent) {
+    /// Writes `events` on the calling thread's track, which is described on its first use.
+    ///
+    /// The events share one timestamp, so slices that a non-LIFO exit ends and begins again
+    /// resume exactly where they ended.
+    fn write_on_thread_track(&self, events: Vec<idl::TrackEvent>) {
         if self.lifecycle.is_finished() {
             return;
         }
-        event.track_uuid = Some(current_thread_uuid());
-        let mut packets = Vec::with_capacity(2);
+        let track_uuid = current_thread_uuid();
+        let mut packets = Vec::with_capacity(events.len() + 1);
         if idl_helpers::first_thread_track_use(self.layer_id) {
             packets.push(track_descriptor_packet(
                 idl_helpers::current_thread_track_descriptor(),
             ));
         }
-        packets.push(self.event_packet(event));
+        let timestamp = self.sequence.now();
+        packets.extend(events.into_iter().map(|mut event| {
+            event.track_uuid = Some(track_uuid);
+            self.event_packet_at(event, timestamp)
+        }));
         self.write_packets(packets);
     }
 
     /// Wraps `event` in a packet timestamped now.
     fn event_packet(&self, event: idl::TrackEvent) -> idl::TracePacket {
+        self.event_packet_at(event, self.sequence.now())
+    }
+
+    fn event_packet_at(&self, event: idl::TrackEvent, timestamp: u64) -> idl::TracePacket {
         idl::TracePacket {
             data: Some(idl::trace_packet::Data::TrackEvent(event)),
-            ..self.sequence.timestamped_packet()
+            ..self.sequence.packet_at(timestamp)
         }
+    }
+
+    /// Writes the begin of a new span's lifetime slice and returns where that slice lies.
+    fn begin_lifetime_slice<S>(
+        &self,
+        span: &tracing_subscriber::registry::SpanRef<'_, S>,
+        own_track_name: Option<&str>,
+        slice_name: &str,
+        correlation_id: u64,
+        debug_annotations: DebugAnnotations,
+    ) -> LifetimeSlice
+    where
+        S: for<'a> LookupSpan<'a>,
+    {
+        // The begin is timestamped after the placement, so it follows the end of any sibling
+        // whose close freed the track.
+        let placement = self.place_span(span, own_track_name);
+        let mut event = create_event(
+            placement.track_uuid,
+            Some(slice_name),
+            span.metadata().file().zip(span.metadata().line()),
+            debug_annotations,
+            Some(idl::track_event::Type::SliceBegin),
+        );
+        event.correlation_id_field = Some(idl::track_event::CorrelationIdField::CorrelationId(
+            correlation_id,
+        ));
+        let mut packets = Vec::with_capacity(2);
+        packets.extend(placement.new_track.map(track_descriptor_packet));
+        packets.push(self.event_packet(event));
+        self.write_packets(packets);
+
+        LifetimeSlice {
+            track_uuid: placement.track_uuid,
+            open_children_on_track: 0,
+            track_parent: placement.track_parent,
+        }
+    }
+
+    /// Builds the begin of a slice of `span_state` entered on the calling thread.
+    ///
+    /// A lifetime slice carries the span's fields and source location, so an entered slice
+    /// repeats them only when span lifetimes are off.
+    fn entered_slice_begin(
+        &self,
+        metadata: &'static Metadata<'static>,
+        span_state: &PerfettoSpanState,
+    ) -> idl::TrackEvent {
+        let with_details = !self.config.span_lifetimes;
+        let annotations = if with_details {
+            span_state
+                .creation_annotations
+                .iter()
+                .chain(&span_state.recorded_annotations)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let location = with_details
+            .then(|| metadata.file().zip(metadata.line()))
+            .flatten();
+        let mut event = create_event(
+            current_thread_uuid(),
+            Some(&span_state.slice_name),
+            location,
+            DebugAnnotations { annotations },
+            Some(idl::track_event::Type::SliceBegin),
+        );
+        event.correlation_id_field = Some(idl::track_event::CorrelationIdField::CorrelationId(
+            span_state.correlation_id,
+        ));
+        event
     }
 
     /// Chooses the track of a new span's slice.
@@ -528,6 +671,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             let Some(ancestor_state) = extensions
                 .get_mut::<PerfettoSpanStates>()
                 .and_then(|states| states.get_mut(self.layer_id))
+                .and_then(|state| state.lifetime.as_mut())
             else {
                 continue;
             };
@@ -754,7 +898,7 @@ where
     W: PerfettoWriter + 'static,
 {
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        if !self.config.span_lifetimes {
+        if !self.config.span_lifetimes && !self.config.thread_slices {
             return;
         }
         let Some(span) = ctx.span(id) else {
@@ -784,29 +928,30 @@ where
         };
         attrs.record(&mut visitor);
 
-        let slice_name = slice_name_override
-            .as_deref()
-            .unwrap_or_else(|| span.name());
+        let slice_name = slice_name_override.map_or(Cow::Borrowed(span.name()), Cow::Owned);
 
-        // The begin is timestamped after the placement, so it follows the end of any sibling
-        // whose close freed the track.
-        let placement = self.place_span(&span, user_track_name.as_deref());
-        let event = create_event(
-            placement.track_uuid,
-            Some(slice_name),
-            span.metadata().file().zip(span.metadata().line()),
-            debug_annotations,
-            Some(idl::track_event::Type::SliceBegin),
-        );
-        let mut packets = Vec::with_capacity(2);
-        packets.extend(placement.new_track.map(track_descriptor_packet));
-        packets.push(self.event_packet(event));
-        self.write_packets(packets);
+        // Without a lifetime slice to carry them, the creation fields go on every entered slice.
+        let creation_annotations = if self.config.span_lifetimes {
+            Vec::new()
+        } else {
+            std::mem::take(&mut debug_annotations.annotations)
+        };
+        let correlation_id = idl_helpers::unique_uuid();
+        let lifetime = self.config.span_lifetimes.then(|| {
+            self.begin_lifetime_slice(
+                &span,
+                user_track_name.as_deref(),
+                &slice_name,
+                correlation_id,
+                debug_annotations,
+            )
+        });
 
         let span_state = PerfettoSpanState {
-            track_uuid: placement.track_uuid,
-            open_children_on_track: 0,
-            track_parent: placement.track_parent,
+            slice_name,
+            correlation_id,
+            lifetime,
+            creation_annotations,
             recorded_annotations: Vec::new(),
         };
         PerfettoSpanStates::insert(&mut span.extensions_mut(), self.layer_id, span_state);
@@ -869,15 +1014,50 @@ where
                 span.extensions()
                     .get::<PerfettoSpanStates>()
                     .and_then(|states| states.get(self.layer_id))
-                    .map(|span_state| span_state.track_uuid)
+                    .and_then(|span_state| span_state.lifetime.as_ref())
+                    .map(|lifetime| lifetime.track_uuid)
             })
         });
         let Some(span_track_uuid) = span_track_uuid else {
-            self.write_on_thread_track(track_event);
+            self.write_on_thread_track(vec![track_event]);
             return;
         };
         track_event.track_uuid = Some(span_track_uuid);
         self.write_packets(vec![self.event_packet(track_event)]);
+    }
+
+    fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+        if !self.config.thread_slices || self.lifecycle.is_finished() {
+            return;
+        }
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let begin = {
+            let extensions = span.extensions();
+            let Some(span_state) = extensions
+                .get::<PerfettoSpanStates>()
+                .and_then(|states| states.get(self.layer_id))
+            else {
+                return;
+            };
+            self.entered_slice_begin(span.metadata(), span_state)
+        };
+        if thread_slices::enter(self.layer_id, id.clone(), &begin) {
+            self.write_on_thread_track(vec![begin]);
+        }
+    }
+
+    fn on_exit(&self, id: &Id, _ctx: Context<'_, S>) {
+        if !self.config.thread_slices {
+            return;
+        }
+        // Only the thread's own stack decides what ends, because the exiting span may be closed
+        // already or entered on other threads too.
+        let events = thread_slices::exit(self.layer_id, id);
+        if !events.is_empty() {
+            self.write_on_thread_track(events);
+        }
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -892,11 +1072,14 @@ where
         else {
             return;
         };
+        let Some(lifetime) = span_state.lifetime else {
+            return;
+        };
 
         // The end carries no name or location, because trace processor takes them from the begin
         // and merges the end's annotations into the slice.
         let event = create_event(
-            span_state.track_uuid,
+            lifetime.track_uuid,
             None,
             None,
             DebugAnnotations {
@@ -908,12 +1091,14 @@ where
 
         // Free the parent's track only after writing the end, so a sibling that nests there next
         // begins after it.
-        if let Some(track_parent_id) = span_state.track_parent
+        if let Some(track_parent_id) = lifetime.track_parent
             && let Some(track_parent) = ctx.span(&track_parent_id)
             && let Some(states) = track_parent
                 .extensions_mut()
                 .get_mut::<PerfettoSpanStates>()
-            && let Some(track_parent_state) = states.get_mut(self.layer_id)
+            && let Some(track_parent_state) = states
+                .get_mut(self.layer_id)
+                .and_then(|state| state.lifetime.as_mut())
         {
             track_parent_state.open_children_on_track =
                 track_parent_state.open_children_on_track.saturating_sub(1);
@@ -1026,7 +1211,7 @@ mod tests {
             };
             track_events_seen += 1;
 
-            // The slice takes its name from the begin, so the end carries none.
+            // Each slice takes its name from the begin, so the end carries none.
             match event.r#type() {
                 track_event::Type::SliceBegin => {
                     saw_slice_begin = true;
@@ -1040,7 +1225,8 @@ mod tests {
                 other => return fail!("unexpected track event type: {other:?}"),
             }
         }
-        expect_eq!(track_events_seen, 2);
+        // The lifetime slice and the entered slice each begin and end.
+        expect_eq!(track_events_seen, 4);
         expect_true!(saw_slice_begin);
         expect_true!(saw_slice_end);
         Ok(())
@@ -1051,8 +1237,11 @@ mod tests {
     fn test_span_arguments() -> Result<()> {
         let writer = TestWriter::new();
         let extra_writer = writer.make_writer();
+        // Entered slices carry no fields while span lifetimes are on, so only the lifetime
+        // slice is recorded.
         let perfetto_layer = PerfettoLayer::new(writer)
             .with_debug_annotations(true)
+            .with_thread_slices(false)
             .with_filter_by_marker(|s| s == "regular_arg");
 
         let subscriber = tracing_subscriber::registry().with(perfetto_layer);
@@ -1159,9 +1348,9 @@ mod tests {
         expect_that!(buf.as_slice(), not(is_empty()));
         let trace = idl::Trace::decode(buf.as_slice()).or_fail()?;
 
-        // Only the begin names the slice.
+        // Only the begins of the lifetime slice and the entered slice name them.
         let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
-        expect_eq!(names, ["otel-name"]);
+        expect_eq!(names, ["otel-name", "otel-name"]);
         Ok(())
     }
 
@@ -1183,14 +1372,14 @@ mod tests {
         expect_that!(buf.as_slice(), not(is_empty()));
         let trace = idl::Trace::decode(buf.as_slice()).or_fail()?;
 
-        // Only the begin names the slice.
+        // Only the begins of the lifetime slice and the entered slice name them.
         let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
-        expect_eq!(names, ["my-otel-span"]);
+        expect_eq!(names, ["my-otel-span", "my-otel-span"]);
         Ok(())
     }
 
-    // If all our spans are filtered, we shouldn't get any trace data at all. Doing a `.record` on
-    // a span should also "fail successfully".
+    // If all our spans are filtered, we shouldn't get any trace data at all.
+    // Doing a `.record` on a span should also "fail successfully".
     #[gtest]
     fn test_span_arguments_filtered() {
         let writer = TestWriter::new();
@@ -1282,7 +1471,8 @@ mod tests {
     fn is_process_descriptor(packet: &idl::TracePacket) -> bool {
         matches!(
             &packet.data,
-            Some(idl::trace_packet::Data::TrackDescriptor(descriptor)) if descriptor.process.is_some()
+            Some(idl::trace_packet::Data::TrackDescriptor(descriptor))
+                if descriptor.process.is_some()
         )
     }
 
@@ -1573,13 +1763,14 @@ mod tests {
             expect_preamble_once(trace)?;
             expect_self_contained(trace);
 
-            // Both spans begin, and the event inside the child is recorded once.
+            // Both spans begin a lifetime and an entered slice, and the event inside the child is
+            // recorded once.
             let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
             let (event_names, mut span_names): (Vec<_>, Vec<_>) = names
                 .into_iter()
                 .partition(|name| name.starts_with("event "));
             span_names.sort();
-            expect_eq!(span_names, ["child", "parent"]);
+            expect_eq!(span_names, ["child", "child", "parent", "parent"]);
             expect_eq!(event_names.len(), 1);
         }
 
@@ -1696,9 +1887,9 @@ mod tests {
             .collect();
         let mut sorted_timestamps = timestamps.clone();
         sorted_timestamps.sort_unstable();
-        // Each iteration writes two slice begins, two instants and two slice ends, then another
-        // instant.
-        expect_eq!(timestamps.len(), 21);
+        // Each iteration writes two lifetime and two entered slices, each with a begin and an
+        // end, and two instants, then another instant.
+        expect_eq!(timestamps.len(), 33);
         expect_eq!(timestamps, sorted_timestamps);
         Ok(())
     }
@@ -1733,7 +1924,8 @@ mod tests {
                 )
             })
             .count();
-        expect_eq!(slice_begins, 3);
+        // Each span begins a lifetime and an entered slice.
+        expect_eq!(slice_begins, 6);
         Ok(())
     }
 
@@ -1826,8 +2018,9 @@ mod tests {
         let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
         expect_preamble_once(&trace)?;
         expect_sequence_clock(&trace);
+        // Each span begins a lifetime and an entered slice.
         let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
-        expect_eq!(names.len(), THREADS);
+        expect_eq!(names.len(), 2 * THREADS);
         Ok(())
     }
 }

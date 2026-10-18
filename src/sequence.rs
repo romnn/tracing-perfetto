@@ -42,10 +42,20 @@ impl TraceSequence {
         self.process_track_uuid
     }
 
+    /// Returns the current time on [`SEQUENCE_CLOCK_ID`], in nanoseconds since the epoch.
+    pub fn now(&self) -> u64 {
+        duration_nanos(self.epoch.elapsed())
+    }
+
     /// Returns a packet on this sequence, timestamped now on [`SEQUENCE_CLOCK_ID`].
     pub fn timestamped_packet(&self) -> idl::TracePacket {
+        self.packet_at(self.now())
+    }
+
+    /// Returns a packet on this sequence, timestamped at `timestamp` on [`SEQUENCE_CLOCK_ID`].
+    pub fn packet_at(&self, timestamp: u64) -> idl::TracePacket {
         idl::TracePacket {
-            timestamp: Some(duration_nanos(self.epoch.elapsed())),
+            timestamp: Some(timestamp),
             timestamp_clock_id: Some(SEQUENCE_CLOCK_ID),
             ..self.untimestamped_packet()
         }
@@ -82,7 +92,7 @@ impl TraceSequence {
     /// clock, so trace processor keeps the monotonic ordering and displays wall-clock time.
     fn preamble_trace(&self) -> idl::Trace {
         // Read both clocks back to back so that the snapshot pins their offset.
-        let sequence_timestamp = duration_nanos(self.epoch.elapsed());
+        let sequence_timestamp = self.now();
         let realtime_timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, duration_nanos);

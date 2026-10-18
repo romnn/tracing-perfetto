@@ -10,6 +10,8 @@ and adds:
   `ProcessMemorySource`.
 - A track model for concurrent code: every root span gets its own track, sequential children
   nest on their parent's track, and overlapping children get sub-tracks, so slices always nest.
+- Thread slices: each entry of a span, such as each poll of an instrumented future, is a slice
+  on the track of the thread that ran it, linked to the span's lifetime slice.
 - Streaming: slice begins and events are written as they happen, so spans that are still open,
   or never close, appear in the trace.
 - Named tracks through a `perfetto.track_name` span field.
@@ -55,8 +57,14 @@ In the Perfetto UI, spans and events appear on these tracks below the process:
   A child that overlaps an open sibling, as with `join!`, moves to a sub-track named after it.
 - Events inside a span are instants on the span's track; other events are instants on the
   recording thread's track.
+- Each thread's track shows where spans actually ran: every entry of a span is a slice from the
+  enter to the exit, so each poll of an instrumented future is one slice on its worker's track.
+  A span's entered slices and its lifetime slice share a `correlation_id` of the span's own,
+  which links them across threads.
 
-`with_span_lifetimes(false)` turns span slices off and leaves only the events.
+`with_thread_slices(false)` turns entered slices off.
+`with_span_lifetimes(false)` turns lifetime slices off, which leaves a synchronous program a plain
+flame chart per thread.
 
 ## Development
 
