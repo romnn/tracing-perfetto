@@ -35,7 +35,7 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 /// Several layers can share one registry, and each writes a trace that opens on its own.
 ///
 /// Dropping the layer, or finishing it through a [`FinishHandle`], ends the trace.
-pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
+pub struct PerfettoLayer<W> {
     layer_id: LayerId,
     sequence: Arc<TraceSequence>,
     writer: Arc<W>,
