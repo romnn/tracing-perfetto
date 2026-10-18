@@ -4,7 +4,7 @@
 use crate::PerfettoLayer;
 use crate::idl;
 use crate::idl::track_event;
-use crate::test_support::{
+use crate::tests::{
     ReplayedSlice, TestWriter, annotated_layer, annotation_names, close_labeled, decode,
     decode_writes, events_of_type, instant_marked, replay_lifetime_slices, replay_slices,
     slice_named, span_track_descriptors, thread_track_uuids, track_descriptor, track_event,
