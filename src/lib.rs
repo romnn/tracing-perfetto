@@ -1,15 +1,36 @@
 //! A [`tracing_subscriber::Layer`] that writes spans and events as a [Perfetto] trace.
 //!
-//! [`PerfettoLayer`] records each span as a slice and each event as an instant, and writes them as
-//! encoded `Trace` protobuf packets to a [`PerfettoWriter`].
+//! [`PerfettoLayer`] records each span as a slice from its creation to its close, and each event
+//! as an instant.
+//! It streams them as encoded `Trace` protobuf packets to a [`PerfettoWriter`] as they happen, so
+//! a slice's begin is in the trace while the span is still open.
 //! Open the output in the [Perfetto UI].
 //!
-//! Span fields control where a slice appears:
+//! # Tracks
 //!
-//! - `perfetto.track_name` moves the span and its children from the thread's track to a named
-//!   track.
+//! Every root span gets its own track below the process track, named after the span.
+//! A child span nests on its parent's track, unless another child of that parent is still open
+//! there.
+//! A child that overlaps such a sibling gets a sub-track of its parent's track, named after the
+//! child.
+//! An event inside a span is an instant on that span's track, and any other event is an instant
+//! on the track of the thread that records it.
+//!
+//! The Perfetto UI merges tracks of the same name into one visual track, with a lane for each
+//! span that is open at the same time.
+//! Fifty concurrent tasks instrumented as `handle` show as one `handle` track with up to fifty
+//! lanes, each task's sequential children nested beneath its slice, and children that run
+//! concurrently, as in `join!`, on sub-tracks.
+//!
+//! Span fields, read when the span is created, control where its slice appears:
+//!
+//! - `perfetto.track_name` gives the span its own track below the process track, under this
+//!   name.
 //! - `perfetto.slice_name` overrides the slice name, which otherwise falls back to `otel.name` and
 //!   then to the span's name.
+//!
+//! Recording either field later leaves the slice where it is.
+//! [`PerfettoLayer::with_span_lifetimes`] turns span slices off, which leaves only the events.
 //!
 //! [`PerfettoLayer::with_process_memory_rss`] adds a counter track that samples the process's
 //! resident set size.
@@ -76,13 +97,57 @@ mod idl {
 
 mod idl_helpers;
 mod sequence;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod track_tests;
 
 pub mod process_memory;
 
+/// The lifetime slice of a span that a [`PerfettoLayer`] has begun and not yet ended.
 struct PerfettoSpanState {
-    track_descriptor: Option<idl::TrackDescriptor>, // optional track descriptor for this span, defaults to thread if not found
-    slice_name: Option<String>,
-    trace: idl::Trace, // The Protobuf trace messages that we accumulate for this span.
+    /// The track that holds the span's slice.
+    track_uuid: u64,
+    /// The number of the span's open children whose slices nest on the span's track.
+    ///
+    /// A new child nests on the track only while this is 0, so the span's slice is then the
+    /// innermost open slice there.
+    open_children_on_track: usize,
+    /// The span whose track this span's slice nests on, if any.
+    ///
+    /// This span holds one count of that span's `open_children_on_track` until it closes.
+    track_parent: Option<Id>,
+    /// The fields recorded after the span's creation, written on its slice's end.
+    recorded_annotations: Vec<idl::DebugAnnotation>,
+}
+
+/// Where a new span's slice goes.
+struct SpanPlacement {
+    track_uuid: u64,
+    /// The descriptor of a track created for this span, written with the slice's begin.
+    new_track: Option<idl::TrackDescriptor>,
+    track_parent: Option<Id>,
+}
+
+impl SpanPlacement {
+    /// Places the slice on a new track below `parent_uuid`.
+    ///
+    /// The track's UUID is never reused, so concurrent spans of one name never share a track.
+    fn new_track(parent_uuid: u64, name: &str) -> Self {
+        let track_uuid = idl_helpers::unique_uuid();
+        Self {
+            track_uuid,
+            new_track: Some(idl_helpers::create_track_descriptor(
+                Some(track_uuid),
+                Some(parent_uuid),
+                Some(name),
+                None,
+                None,
+                None,
+            )),
+            track_parent: None,
+        }
+    }
 }
 
 /// The span states of every [`PerfettoLayer`] on a registry, stored as one span extension.
@@ -135,7 +200,9 @@ impl PerfettoSpanStates {
 }
 
 /// Identifies one [`PerfettoLayer`] among all layers in the process.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// IDs are never reused, so state keyed by a dropped layer's ID never applies to a later layer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct LayerId(u64);
 
 impl LayerId {
@@ -145,10 +212,12 @@ impl LayerId {
     }
 }
 
-/// A `Layer` that records span as perfetto's
-/// `TYPE_SLICE_BEGIN`/`TYPE_SLICE_END`, and event as `TYPE_INSTANT`.
+/// A [`Layer`] that streams spans as slices and events as instants into a Perfetto trace.
 ///
-/// `PerfettoLayer` will output the records as encoded [protobuf messages](https://github.com/google/perfetto).
+/// A span's slice begins when the span is created and ends when it closes, whichever thread
+/// closes it, on a track chosen as the [crate documentation](crate#tracks) describes.
+/// Every packet is written when the layer observes it, so a trace cut short still holds every
+/// slice begun so far.
 ///
 /// Timestamps come from a monotonic clock that the trace maps onto wall-clock time.
 /// Several layers can share one registry, and each writes a trace that opens on its own.
@@ -218,6 +287,8 @@ impl std::error::Error for DecodeError {
 
 /// Decodes a perfetto trace buffer and returns the names of all contained track events.
 ///
+/// Events without a name, such as slice ends, are skipped.
+///
 /// # Errors
 ///
 /// Returns [`DecodeError`] if the buffer does not contain a valid perfetto `Trace` protobuf.
@@ -255,17 +326,27 @@ impl<W: for<'writer> MakeWriter<'writer> + 'static> PerfettoWriter for W {
     }
 }
 
-#[derive(Default)]
 struct Config {
     debug_annotations: bool,
+    span_lifetimes: bool,
     filter: Option<fn(&str) -> bool>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            debug_annotations: false,
+            span_lifetimes: true,
+            filter: None,
+        }
+    }
 }
 
 impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// Creates a layer that writes encoded trace packets to `writer`.
     ///
-    /// Debug annotations and the field-name filter start disabled, and no process memory is
-    /// sampled.
+    /// Spans are recorded as slices, debug annotations and the field-name filter start
+    /// disabled, and no process memory is sampled.
     #[must_use]
     pub fn new(writer: W) -> Self {
         Self {
@@ -274,7 +355,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             writer: Arc::new(writer),
             config: Config::default(),
 
-            process_memory_rss_track_uuid: TrackUuid::new(rand::random()),
+            process_memory_rss_track_uuid: TrackUuid::new(idl_helpers::unique_uuid()),
             lifecycle: Arc::default(),
         }
     }
@@ -291,6 +372,17 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     #[must_use]
     pub fn with_debug_annotations(mut self, value: bool) -> Self {
         self.config.debug_annotations = value;
+        self
+    }
+
+    /// Configures whether spans are recorded as slices from their creation to their close.
+    ///
+    /// Enabled by default.
+    /// When disabled, spans write nothing and every event is an instant on the track of the
+    /// thread that records it.
+    #[must_use]
+    pub fn with_span_lifetimes(mut self, value: bool) -> Self {
+        self.config.span_lifetimes = value;
         self
     }
 
@@ -379,11 +471,83 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self
     }
 
-    fn write_log(&self, log: idl::Trace, track_descriptor: Option<idl::TrackDescriptor>) {
+    /// Writes `packets` as one `Trace` message, unless the trace is finished.
+    fn write_packets(&self, packets: Vec<idl::TracePacket>) {
         if self.lifecycle.is_finished() {
             return;
         }
-        write_trace(&self.sequence, self.writer.as_ref(), log, track_descriptor);
+        self.sequence
+            .write(self.writer.as_ref(), &idl::Trace { packet: packets });
+    }
+
+    /// Writes `event` on the calling thread's track, which is described on its first use.
+    fn write_on_thread_track(&self, mut event: idl::TrackEvent) {
+        if self.lifecycle.is_finished() {
+            return;
+        }
+        event.track_uuid = Some(current_thread_uuid());
+        let mut packets = Vec::with_capacity(2);
+        if idl_helpers::first_thread_track_use(self.layer_id) {
+            packets.push(track_descriptor_packet(
+                idl_helpers::current_thread_track_descriptor(),
+            ));
+        }
+        packets.push(self.event_packet(event));
+        self.write_packets(packets);
+    }
+
+    /// Wraps `event` in a packet timestamped now.
+    fn event_packet(&self, event: idl::TrackEvent) -> idl::TracePacket {
+        idl::TracePacket {
+            data: Some(idl::trace_packet::Data::TrackEvent(event)),
+            ..self.sequence.timestamped_packet()
+        }
+    }
+
+    /// Chooses the track of a new span's slice.
+    ///
+    /// A span nests on the track of its nearest recorded ancestor while no other child of that
+    /// ancestor is open there.
+    /// The ancestor's slice is then the innermost open slice on the track, because a span on a
+    /// track holds its ancestor's count until it closes and a child closes before its parent.
+    fn place_span<S>(
+        &self,
+        span: &tracing_subscriber::registry::SpanRef<'_, S>,
+        own_track_name: Option<&str>,
+    ) -> SpanPlacement
+    where
+        S: for<'a> LookupSpan<'a>,
+    {
+        let process_track_uuid = self.sequence.process_track_uuid();
+        if let Some(track_name) = own_track_name {
+            return SpanPlacement::new_track(process_track_uuid, track_name);
+        }
+
+        for ancestor in span.scope().skip(1) {
+            let mut extensions = ancestor.extensions_mut();
+            let Some(ancestor_state) = extensions
+                .get_mut::<PerfettoSpanStates>()
+                .and_then(|states| states.get_mut(self.layer_id))
+            else {
+                continue;
+            };
+
+            // Nest on the ancestor's track
+            if ancestor_state.open_children_on_track == 0 {
+                ancestor_state.open_children_on_track = 1;
+                return SpanPlacement {
+                    track_uuid: ancestor_state.track_uuid,
+                    new_track: None,
+                    track_parent: Some(ancestor.id()),
+                };
+            }
+
+            // Overlap a sibling
+            return SpanPlacement::new_track(ancestor_state.track_uuid, span.name());
+        }
+
+        // Root span
+        SpanPlacement::new_track(process_track_uuid, span.name())
     }
 }
 
@@ -489,23 +653,11 @@ fn write_process_memory_rss_sample<W: PerfettoWriter>(
     config.sequence.write(config.writer.as_ref(), &trace);
 }
 
-fn write_trace<W: PerfettoWriter>(
-    sequence: &TraceSequence,
-    writer: &W,
-    mut trace: idl::Trace,
-    track_descriptor: Option<idl::TrackDescriptor>,
-) {
-    if let Some(track_descriptor) = track_descriptor {
-        trace.packet.insert(
-            0,
-            idl::TracePacket {
-                data: Some(idl::trace_packet::Data::TrackDescriptor(track_descriptor)),
-                ..Default::default()
-            },
-        );
+fn track_descriptor_packet(descriptor: idl::TrackDescriptor) -> idl::TracePacket {
+    idl::TracePacket {
+        data: Some(idl::trace_packet::Data::TrackDescriptor(descriptor)),
+        ..Default::default()
     }
-
-    sequence.write(writer, &trace);
 }
 
 struct TrackUuid(u64);
@@ -602,6 +754,9 @@ where
     W: PerfettoWriter + 'static,
 {
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        if !self.config.span_lifetimes {
+            return;
+        }
         let Some(span) = ctx.span(id) else {
             return;
         };
@@ -621,21 +776,6 @@ where
             attrs.record(&mut debug_annotations);
         }
 
-        let mut packet = self.sequence.timestamped_packet();
-
-        // check if parent span has a non default track descriptor
-        let inherited_track_descriptor = span
-            .parent()
-            // If the span has a parent, try retrieving the track descriptor from the parent's state
-            .and_then(|parent_span| {
-                parent_span
-                    .extensions()
-                    .get::<PerfettoSpanStates>()
-                    .and_then(|states| states.get(self.layer_id))
-                    .map(|state| state.track_descriptor.clone())
-            })
-            .flatten();
-
         let mut user_track_name = None;
         let mut slice_name_override = None;
         let mut visitor = TrackNameVisitor {
@@ -648,62 +788,48 @@ where
             .as_deref()
             .unwrap_or_else(|| span.name());
 
-        // Resolve the optional track descriptor for this span (either inherited from parent, user set, or None).
-        // For named tracks, reuse a stable UUID per track name so the Perfetto UI gets a single lane.
-        let span_track_descriptor = user_track_name
-            .as_deref()
-            .map(|name| idl::TrackDescriptor {
-                static_or_dynamic_name: Some(idl::track_descriptor::StaticOrDynamicName::Name(
-                    name.to_string(),
-                )),
-                ..idl::TrackDescriptor::named_child_for(name, self.sequence.process_track_uuid())
-            })
-            .or(inherited_track_descriptor);
-
-        let final_uuid = span_track_descriptor
-            .as_ref()
-            .map_or_else(current_thread_uuid, idl::TrackDescriptor::uuid);
-
+        // The begin is timestamped after the placement, so it follows the end of any sibling
+        // whose close freed the track.
+        let placement = self.place_span(&span, user_track_name.as_deref());
         let event = create_event(
-            final_uuid, // span track id if exists, otherwise thread track id
+            placement.track_uuid,
             Some(slice_name),
             span.metadata().file().zip(span.metadata().line()),
             debug_annotations,
             Some(idl::track_event::Type::SliceBegin),
         );
-        packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
+        let mut packets = Vec::with_capacity(2);
+        packets.extend(placement.new_track.map(track_descriptor_packet));
+        packets.push(self.event_packet(event));
+        self.write_packets(packets);
 
         let span_state = PerfettoSpanState {
-            track_descriptor: span_track_descriptor,
-            slice_name: if slice_name == span.name() {
-                None
-            } else {
-                Some(slice_name.to_string())
-            },
-            trace: idl::Trace {
-                packet: vec![packet],
-            },
+            track_uuid: placement.track_uuid,
+            open_children_on_track: 0,
+            track_parent: placement.track_parent,
+            recorded_annotations: Vec::new(),
         };
         PerfettoSpanStates::insert(&mut span.extensions_mut(), self.layer_id, span_state);
     }
 
     fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        if !self.config.debug_annotations {
+            return;
+        }
         let Some(span) = ctx.span(span) else {
             return;
         };
 
-        // We don't check the filter here -- we've already checked it when we handled the span on
-        // `on_new_span`. Iff we successfully attached a track packet to the span, then we'll also
-        // update the trace packet with the debug data here.
+        // The filter was checked in `on_new_span`, which stores state only for recorded spans.
+        // Routing and naming are fixed at creation, so a late `perfetto.track_name` or
+        // `perfetto.slice_name` is only an annotation.
         if let Some(states) = span.extensions_mut().get_mut::<PerfettoSpanStates>()
-            && let Some(extension) = states.get_mut(self.layer_id)
-            && let Some(packet) = extension.trace.packet.get_mut(0)
-            && let Some(idl::trace_packet::Data::TrackEvent(event)) = &mut packet.data
+            && let Some(span_state) = states.get_mut(self.layer_id)
         {
             let mut debug_annotations = DebugAnnotations::default();
             values.record(&mut debug_annotations);
-            event
-                .debug_annotations
+            span_state
+                .recorded_annotations
                 .append(&mut debug_annotations.annotations);
         }
     }
@@ -728,7 +854,6 @@ where
             event.record(&mut debug_annotations);
         }
 
-        let thread_track_uuid = current_thread_uuid();
         let mut track_event = create_event(
             0,
             Some(metadata.name()),
@@ -737,29 +862,22 @@ where
             Some(idl::track_event::Type::Instant),
         );
 
-        let mut packet = self.sequence.timestamped_packet();
-
-        if let Some(span) = ctx.event_span(event)
-            && let Some(states) = span.extensions_mut().get_mut::<PerfettoSpanStates>()
-            && let Some(span_state) = states.get_mut(self.layer_id)
-        {
-            track_event.track_uuid = span_state
-                .track_descriptor
-                .as_ref()
-                .map(idl::TrackDescriptor::uuid)
-                .or(Some(current_thread_uuid()));
-            packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
-            span_state.trace.packet.push(packet);
+        // An event belongs to its explicit parent or else the current span, and lands on the
+        // track of the nearest such span that this layer records.
+        let span_track_uuid = ctx.event_span(event).and_then(|event_span| {
+            event_span.scope().find_map(|span| {
+                span.extensions()
+                    .get::<PerfettoSpanStates>()
+                    .and_then(|states| states.get(self.layer_id))
+                    .map(|span_state| span_state.track_uuid)
+            })
+        });
+        let Some(span_track_uuid) = span_track_uuid else {
+            self.write_on_thread_track(track_event);
             return;
-        }
-
-        // no span or no span state, just write the event
-        track_event.track_uuid = Some(thread_track_uuid);
-        packet.data = Some(idl::trace_packet::Data::TrackEvent(track_event));
-        let trace = idl::Trace {
-            packet: vec![packet],
         };
-        self.write_log(trace, Some(idl_helpers::current_thread_track_descriptor()));
+        track_event.track_uuid = Some(span_track_uuid);
+        self.write_packets(vec![self.event_packet(track_event)]);
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -767,7 +885,7 @@ where
             return;
         };
 
-        let Some(mut span_state) = span
+        let Some(span_state) = span
             .extensions_mut()
             .get_mut::<PerfettoSpanStates>()
             .and_then(|states| states.remove(self.layer_id))
@@ -775,39 +893,31 @@ where
             return;
         };
 
-        let debug_annotations = DebugAnnotations::default();
-
-        let track_uuid = span_state
-            .track_descriptor
-            .as_ref()
-            .map_or_else(current_thread_uuid, idl::TrackDescriptor::uuid);
-
-        let mut packet = self.sequence.timestamped_packet();
-        let meta = span.metadata();
-        let slice_name = span_state
-            .slice_name
-            .as_deref()
-            .unwrap_or_else(|| meta.name());
-
+        // The end carries no name or location, because trace processor takes them from the begin
+        // and merges the end's annotations into the slice.
         let event = create_event(
-            track_uuid,
-            Some(slice_name),
-            meta.file().zip(meta.line()),
-            debug_annotations,
+            span_state.track_uuid,
+            None,
+            None,
+            DebugAnnotations {
+                annotations: span_state.recorded_annotations,
+            },
             Some(idl::track_event::Type::SliceEnd),
         );
-        packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
+        self.write_packets(vec![self.event_packet(event)]);
 
-        span_state.trace.packet.push(packet);
-
-        self.write_log(
-            span_state.trace,
-            Some(
-                span_state
-                    .track_descriptor
-                    .unwrap_or_else(idl_helpers::current_thread_track_descriptor),
-            ),
-        );
+        // Free the parent's track only after writing the end, so a sibling that nests there next
+        // begins after it.
+        if let Some(track_parent_id) = span_state.track_parent
+            && let Some(track_parent) = ctx.span(&track_parent_id)
+            && let Some(states) = track_parent
+                .extensions_mut()
+                .get_mut::<PerfettoSpanStates>()
+            && let Some(track_parent_state) = states.get_mut(self.layer_id)
+        {
+            track_parent_state.open_children_on_track =
+                track_parent_state.open_children_on_track.saturating_sub(1);
+        }
     }
 }
 
@@ -879,8 +989,8 @@ mod tests {
     use crate::idl;
     use crate::idl::track_event;
     use crate::sequence::SEQUENCE_CLOCK_ID;
+    use crate::test_support::TestWriter;
     use googletest::prelude::*;
-    use parking_lot::Mutex;
     use prost::Message;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -888,43 +998,6 @@ mod tests {
     use std::sync::mpsc;
     use tracing::{field, trace_span};
     use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
-
-    /// A Sink for testing that can be passed to `PerfettoLayer::new` to write trace data to. The
-    /// sink just accumulates the trace data into a buffer in memory. The data will be
-    /// `idl::Trace` protobufs which can be `.decode`'ed.
-    struct TestWriter {
-        buf: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl TestWriter {
-        fn new() -> Self {
-            Self {
-                buf: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for TestWriter {
-        type Writer = TestWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            TestWriter {
-                buf: self.buf.clone(),
-            }
-        }
-    }
-
-    impl std::io::Write for TestWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let mut guard = self.buf.lock();
-            guard.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            // There's nothing to flush, we always immediately append to the buffer.
-            std::io::Result::Ok(())
-        }
-    }
 
     // Check that we are able to write a span and confirm that it's written as protobuf data to the
     // output
@@ -952,12 +1025,18 @@ mod tests {
                 continue;
             };
             track_events_seen += 1;
-            let expected = Some(track_event::NameField::Name(String::from("simple_span")));
-            expect_eq!(event.name_field, expected);
 
+            // The slice takes its name from the begin, so the end carries none.
             match event.r#type() {
-                track_event::Type::SliceBegin => saw_slice_begin = true,
-                track_event::Type::SliceEnd => saw_slice_end = true,
+                track_event::Type::SliceBegin => {
+                    saw_slice_begin = true;
+                    let expected = Some(track_event::NameField::Name(String::from("simple_span")));
+                    expect_eq!(event.name_field, expected);
+                }
+                track_event::Type::SliceEnd => {
+                    saw_slice_end = true;
+                    expect_eq!(event.name_field, None);
+                }
                 other => return fail!("unexpected track event type: {other:?}"),
             }
         }
@@ -1000,18 +1079,19 @@ mod tests {
                 continue;
             };
             track_events_seen += 1;
-            let expected = Some(track_event::NameField::Name(String::from("span_with_args")));
-            expect_eq!(event.name_field, expected);
 
             match event.r#type() {
                 track_event::Type::SliceBegin => {
                     saw_slice_begin = true;
+                    let expected =
+                        Some(track_event::NameField::Name(String::from("span_with_args")));
+                    expect_eq!(event.name_field, expected);
 
-                    // The SliceBegin isn't recorded until it's dropped, so both the args are added to the
-                    // SliceBegin record.
+                    // The begin is written when the span is created, so it carries only the
+                    // fields given at creation.
                     let annotations = event.debug_annotations.as_slice();
-                    let [first, second] = annotations else {
-                        return fail!("expected 2 debug annotations, got {}", annotations.len());
+                    let [first] = annotations else {
+                        return fail!("expected 1 debug annotation, got {}", annotations.len());
                     };
                     expect_eq!(
                         first.name_field,
@@ -1025,23 +1105,28 @@ mod tests {
                             "Arg data".to_string(),
                         ))
                     );
+                }
+                track_event::Type::SliceEnd => {
+                    saw_slice_end = true;
+
+                    // The end carries the field recorded later, which trace processor merges
+                    // into the slice's arguments.
+                    let annotations = event.debug_annotations.as_slice();
+                    let [recorded] = annotations else {
+                        return fail!("expected 1 debug annotation, got {}", annotations.len());
+                    };
                     expect_eq!(
-                        second.name_field,
+                        recorded.name_field,
                         Some(idl::debug_annotation::NameField::Name(
                             "extra_arg".to_string(),
                         ))
                     );
                     expect_eq!(
-                        second.value,
+                        recorded.value,
                         Some(idl::debug_annotation::Value::StringValue(
                             "Some Extra Data".to_string(),
                         ))
                     );
-                }
-                track_event::Type::SliceEnd => {
-                    saw_slice_end = true;
-                    // The SliceEnd won't have any arguments
-                    expect_eq!(event.debug_annotations.len(), 0);
                 }
                 other => return fail!("unexpected track event type: {other:?}"),
             }
@@ -1074,17 +1159,9 @@ mod tests {
         expect_that!(buf.as_slice(), not(is_empty()));
         let trace = idl::Trace::decode(buf.as_slice()).or_fail()?;
 
-        let mut track_events_seen = 0;
-        for packet in trace.packet {
-            let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data else {
-                continue;
-            };
-            track_events_seen += 1;
-
-            let expected = Some(track_event::NameField::Name(String::from("otel-name")));
-            expect_eq!(event.name_field, expected);
-        }
-        expect_eq!(track_events_seen, 2);
+        // Only the begin names the slice.
+        let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
+        expect_eq!(names, ["otel-name"]);
         Ok(())
     }
 
@@ -1106,17 +1183,9 @@ mod tests {
         expect_that!(buf.as_slice(), not(is_empty()));
         let trace = idl::Trace::decode(buf.as_slice()).or_fail()?;
 
-        let mut track_events_seen = 0;
-        for packet in trace.packet {
-            let Some(idl::trace_packet::Data::TrackEvent(ref event)) = packet.data else {
-                continue;
-            };
-            track_events_seen += 1;
-
-            let expected = Some(track_event::NameField::Name(String::from("my-otel-span")));
-            expect_eq!(event.name_field, expected);
-        }
-        expect_eq!(track_events_seen, 2);
+        // Only the begin names the slice.
+        let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
+        expect_eq!(names, ["my-otel-span"]);
         Ok(())
     }
 
@@ -1373,22 +1442,22 @@ mod tests {
         let dispatch =
             tracing::Dispatch::new(tracing_subscriber::registry().with(PerfettoLayer::new(writer)));
 
-        // Record one span on the test thread and one on a worker thread.
+        // Record one unscoped event on the test thread, then one on a worker thread.
         let main_kernel_thread_id = record_on_current_thread(&dispatch, || {
-            trace_span!("main_thread_span").in_scope(|| {});
+            tracing::info!("on the main thread");
         })?;
         let worker_kernel_thread_id = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     record_on_current_thread(&dispatch, || {
-                        trace_span!("worker_thread_span").in_scope(|| {});
+                        tracing::info!("on the worker thread");
                     })
                 })
                 .join()
         })
         .or_fail()??;
 
-        // Map each span to the thread ID of the track its slice begins on.
+        // Map each event, in recording order, to the thread ID of the track it is on.
         let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
         let thread_ids: HashMap<u64, Option<i32>> = trace
             .packet
@@ -1401,19 +1470,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let span_thread_id = |span_name: &str| {
-            trace.packet.iter().find_map(|packet| match &packet.data {
-                Some(idl::trace_packet::Data::TrackEvent(event))
-                    if event.name_field
-                        == Some(track_event::NameField::Name(span_name.to_string())) =>
-                {
-                    thread_ids.get(&event.track_uuid()).copied().flatten()
+        let event_thread_ids: Vec<Option<i32>> = trace
+            .packet
+            .iter()
+            .filter_map(|packet| match &packet.data {
+                Some(idl::trace_packet::Data::TrackEvent(event)) => {
+                    Some(thread_ids.get(&event.track_uuid()).copied().flatten())
                 }
                 _ => None,
             })
+            .collect();
+        let [Some(main_thread_id), Some(worker_thread_id)] = event_thread_ids[..] else {
+            return fail!("expected two events on thread tracks, got {event_thread_ids:?}");
         };
-        let main_thread_id = span_thread_id("main_thread_span").or_fail()?;
-        let worker_thread_id = span_thread_id("worker_thread_span").or_fail()?;
 
         // Each thread track names its own, valid thread.
         expect_ne!(main_thread_id, worker_thread_id);
@@ -1487,7 +1556,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // A named parent makes the child read its track from the parent's per-layer state, and
-        // the recorded field and the event each update only the recording layer's state.
+        // the recorded field updates only the recording layer's state.
         trace_span!(
             "parent",
             { "perfetto.track_name" } = "jobs",
@@ -1504,13 +1573,13 @@ mod tests {
             expect_preamble_once(trace)?;
             expect_self_contained(trace);
 
-            // Both spans begin and end, and the event inside the child is recorded once.
+            // Both spans begin, and the event inside the child is recorded once.
             let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
             let (event_names, mut span_names): (Vec<_>, Vec<_>) = names
                 .into_iter()
                 .partition(|name| name.starts_with("event "));
             span_names.sort();
-            expect_eq!(span_names, ["child", "child", "parent", "parent"]);
+            expect_eq!(span_names, ["child", "parent"]);
             expect_eq!(event_names.len(), 1);
         }
 
@@ -1535,7 +1604,8 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(perfetto_layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        // Cover every write path: span close, unscoped event and memory sample.
+        // Cover every write path: span begin and end, span event, unscoped event and memory
+        // sample.
         trace_span!("span").in_scope(|| tracing::info!("inside the span"));
         tracing::info!("outside any span");
         wait_for_written_sample(&announcements)?;
@@ -1608,9 +1678,12 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        // Spans are buffered until they close, so only unnested spans are written in time order.
+        // Packets are written as they happen, so nested spans are written in time order too.
         for _ in 0..3 {
-            trace_span!("span").in_scope(|| tracing::info!("inside the span"));
+            trace_span!("span").in_scope(|| {
+                tracing::info!("inside the span");
+                trace_span!("child").in_scope(|| tracing::info!("inside the child"));
+            });
             tracing::info!("outside any span");
         }
 
@@ -1623,8 +1696,9 @@ mod tests {
             .collect();
         let mut sorted_timestamps = timestamps.clone();
         sorted_timestamps.sort_unstable();
-        // Each iteration writes a slice begin, an instant and a slice end, then another instant.
-        expect_eq!(timestamps.len(), 12);
+        // Each iteration writes two slice begins, two instants and two slice ends, then another
+        // instant.
+        expect_eq!(timestamps.len(), 21);
         expect_eq!(timestamps, sorted_timestamps);
         Ok(())
     }
@@ -1640,7 +1714,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        // Each closed span and each unscoped event is a separate write.
+        // Each slice begin, slice end and unscoped event is a separate write.
         for _ in 0..3 {
             trace_span!("span").in_scope(|| {});
             tracing::info!("outside any span");
@@ -1694,7 +1768,7 @@ mod tests {
         Ok(())
     }
 
-    /// The preamble precedes everything when a span closes before the memory sampler writes.
+    /// The preamble precedes everything when a span is written before the memory sampler writes.
     ///
     /// A preamble written only by the sampler would follow the span's packets.
     #[gtest]
@@ -1732,15 +1806,14 @@ mod tests {
         let finish = perfetto_layer.finish_handle();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(perfetto_layer));
 
-        // Release every thread's first span close and the sampler's first sample together.
+        // Release every thread's first span and the sampler's first sample together.
         let start = std::sync::Barrier::new(THREADS + 1);
         std::thread::scope(|scope| {
             for _ in 0..THREADS {
                 scope.spawn(|| {
                     tracing::dispatcher::with_default(&dispatch, || {
-                        let span = trace_span!("racing_span");
                         start.wait();
-                        drop(span);
+                        trace_span!("racing_span").in_scope(|| {});
                     });
                 });
             }
@@ -1754,7 +1827,7 @@ mod tests {
         expect_preamble_once(&trace)?;
         expect_sequence_clock(&trace);
         let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
-        expect_eq!(names.len(), 2 * THREADS);
+        expect_eq!(names.len(), THREADS);
         Ok(())
     }
 }

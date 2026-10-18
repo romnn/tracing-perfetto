@@ -1,9 +1,12 @@
-use crate::idl;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::{LayerId, idl};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 thread_local! {
     static THREAD_TRACK_UUID: AtomicU64 = AtomicU64::new(unique_uuid());
-    static THREAD_DESCRIPTOR_SENT: AtomicBool = const { AtomicBool::new(false) };
     static OS_THREAD_ID: i32 = os_thread_id();
+    /// The layers whose trace already describes the calling thread's track.
+    static THREAD_TRACK_DESCRIBED_BY: RefCell<HashSet<LayerId>> = RefCell::new(HashSet::new());
 }
 
 #[derive(Default)]
@@ -11,8 +14,21 @@ pub struct DebugAnnotations {
     pub annotations: Vec<idl::DebugAnnotation>,
 }
 
+/// Returns a random track UUID, which is never 0.
 pub fn unique_uuid() -> u64 {
-    rand::random()
+    rand::random_range(1..=u64::MAX)
+}
+
+/// Marks the calling thread's track as described in the trace of `layer_id`.
+///
+/// Returns whether this is the first time, in which case the caller writes the thread's track
+/// descriptor with the packet that first references the track.
+/// During thread teardown, when the record is gone, every call counts as the first, so a packet
+/// never refers to an undescribed track.
+pub fn first_thread_track_use(layer_id: LayerId) -> bool {
+    THREAD_TRACK_DESCRIBED_BY
+        .try_with(|layers| layers.borrow_mut().insert(layer_id))
+        .unwrap_or(true)
 }
 
 pub fn current_thread_uuid() -> u64 {
@@ -78,17 +94,6 @@ pub fn current_thread_track_descriptor() -> idl::TrackDescriptor {
 }
 
 impl idl::TrackDescriptor {
-    pub fn named_child_for(name: &str, parent_uuid: u64) -> Self {
-        idl::TrackDescriptor {
-            uuid: Some(unique_uuid()),
-            parent_uuid: Some(parent_uuid),
-            static_or_dynamic_name: Some(idl::track_descriptor::StaticOrDynamicName::Name(
-                name.to_string(),
-            )),
-            ..Default::default()
-        }
-    }
-
     pub fn for_process_descriptor(uuid: u64, process_descriptor: idl::ProcessDescriptor) -> Self {
         idl::TrackDescriptor {
             uuid: Some(uuid),
@@ -146,7 +151,6 @@ pub fn create_event(
 ) -> idl::TrackEvent {
     let mut event = idl::TrackEvent {
         track_uuid: Some(track_uuid),
-        categories: vec![String::new()],
         name_field: name.map(|name| idl::track_event::NameField::Name(name.to_string())),
         ..Default::default()
     };

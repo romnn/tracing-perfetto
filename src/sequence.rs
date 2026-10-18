@@ -32,7 +32,7 @@ impl TraceSequence {
     pub fn new() -> Self {
         Self {
             sequence_id: rand::random_range(2..=u32::MAX),
-            process_track_uuid: rand::random(),
+            process_track_uuid: idl_helpers::unique_uuid(),
             epoch: Instant::now(),
             preamble: Once::new(),
         }

@@ -1,4 +1,4 @@
-//! Traces nested spans across Tokio tasks into `test.pftrace` in the temporary directory.
+//! Traces nested spans across Tokio tasks into `tokio_example.pftrace` in the temporary directory.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use tracing_subscriber::{Registry, fmt, layer::SubscriberExt};
 const STEP: Duration = Duration::from_millis(250);
 
 fn init_subscriber() -> Result<(), Box<dyn std::error::Error>> {
-    let trace_path = std::env::temp_dir().join("test.pftrace");
+    let trace_path = std::env::temp_dir().join("tokio_example.pftrace");
     let trace_file = std::fs::File::create(&trace_path)?;
     let perfetto_layer =
         PerfettoLayer::new(std::sync::Mutex::new(trace_file)).with_debug_annotations(true);
@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut join_handles = Vec::new();
 
     // example 1: instrument async handler chain with a dedicated span
+    // The tasks share one track name, so the trace viewer shows them as lanes of one track.
     for i in 0..5 {
         let task = async move {
             // info!("task ${i} started");
@@ -54,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::Level::INFO,
             "task",
             i,
-            perfetto.track_name = format!("task track {}", i)
+            perfetto.track_name = "jobs"
         );
         let jh = tokio::spawn(task.instrument(span.or_current()));
         join_handles.push(jh);
