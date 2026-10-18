@@ -6,7 +6,8 @@
 //! child always closes before its parent, the parent's slice is then the innermost open slice on
 //! that track.
 
-use crate::{idl, packets, thread_track};
+use crate::packets::{SourceLocation, UnplacedEvent};
+use crate::{idl, packets};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{Id, Metadata, Subscriber};
@@ -62,15 +63,15 @@ impl SpanState {
         }
     }
 
-    /// Builds the begin of a slice of the span entered on the calling thread.
+    /// Builds the begin of a slice of the span entered on a thread.
     ///
     /// `metadata` is the span's, whose source location the begin carries if the span has no
     /// lifetime slice to carry it.
     pub(crate) fn entered_slice_begin(
         &self,
         metadata: &'static Metadata<'static>,
-    ) -> idl::TrackEvent {
-        let (annotations, location) = match &self.kind {
+    ) -> UnplacedEvent {
+        let (debug_annotations, location) = match &self.kind {
             SpanKind::Lifetime(_) => (Vec::new(), None),
             SpanKind::Entered {
                 creation_annotations,
@@ -80,20 +81,16 @@ impl SpanState {
                     .chain(&self.recorded_annotations)
                     .cloned()
                     .collect(),
-                metadata.file().zip(metadata.line()),
+                SourceLocation::of(metadata),
             ),
         };
-        let mut event = packets::create_event(
-            thread_track::current_thread_uuid(),
-            Some(&self.slice_name),
+        UnplacedEvent {
+            event_type: idl::track_event::Type::SliceBegin,
+            name: Some(self.slice_name.clone()),
             location,
-            annotations,
-            idl::track_event::Type::SliceBegin,
-        );
-        event.correlation_id_field = Some(idl::track_event::CorrelationIdField::CorrelationId(
-            self.correlation_id,
-        ));
-        event
+            debug_annotations,
+            correlation_id: Some(self.correlation_id),
+        }
     }
 }
 

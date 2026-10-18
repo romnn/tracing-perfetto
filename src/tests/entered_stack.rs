@@ -1,12 +1,11 @@
 //! Unit tests for the stack of entered spans that a layer keeps per thread, checked directly
 //! against the slice events each exit returns.
 
-use crate::idl;
 use crate::idl::track_event;
-use crate::packets;
-use crate::tests::event_name;
+use crate::packets::UnplacedEvent;
 use crate::thread_slices::EnteredStack;
 use googletest::prelude::*;
+use std::borrow::Cow;
 use tracing::Id;
 
 /// What an event that an exit returns does to the thread's track.
@@ -19,23 +18,23 @@ enum SliceEvent {
 }
 
 /// Returns the begin of an entered slice named `name`.
-fn begin(name: &str) -> idl::TrackEvent {
-    packets::create_event(
-        1,
-        Some(name),
-        None,
-        Vec::new(),
-        track_event::Type::SliceBegin,
-    )
+fn begin(name: &'static str) -> UnplacedEvent {
+    UnplacedEvent {
+        event_type: track_event::Type::SliceBegin,
+        name: Some(Cow::Borrowed(name)),
+        location: None,
+        debug_annotations: Vec::new(),
+        correlation_id: None,
+    }
 }
 
 /// Returns what each of `events` does to the thread's track.
-fn slice_events(events: &[idl::TrackEvent]) -> Vec<SliceEvent> {
+fn slice_events(events: &[UnplacedEvent]) -> Vec<SliceEvent> {
     events
         .iter()
-        .map(|event| match event.r#type() {
+        .map(|event| match event.event_type {
             track_event::Type::SliceEnd => SliceEvent::End,
-            _ => SliceEvent::Resume(event_name(event).unwrap_or_default().to_string()),
+            _ => SliceEvent::Resume(event.name.as_deref().unwrap_or_default().to_string()),
         })
         .collect()
 }

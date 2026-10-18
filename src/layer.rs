@@ -3,7 +3,7 @@
 
 use crate::fields::{self, DebugAnnotations, NamingFields};
 use crate::lifecycle::{FinishHandle, TraceLifecycle};
-use crate::packets::{self, create_event};
+use crate::packets::{self, SourceLocation, UnplacedEvent};
 use crate::process_memory::sampler::{ProcessMemorySampler, ProcessMemorySamplerConfig};
 use crate::process_memory::{self, ProcessMemorySource};
 use crate::sequence::TraceSequence;
@@ -239,7 +239,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// thread's track before the trace describes it.
     /// The events share one timestamp, so slices that a non-LIFO exit ends and begins again
     /// resume exactly where they ended.
-    fn write_on_thread_track(&self, events: Vec<idl::TrackEvent>) {
+    fn write_on_thread_track(&self, events: Vec<UnplacedEvent>) {
         if self.lifecycle.is_finished() {
             return;
         }
@@ -258,36 +258,45 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             ));
         }
         let timestamp = self.sequence.now();
-        trace_packets.extend(events.into_iter().map(|mut event| {
-            event.track_uuid = Some(track_uuid);
-            self.event_packet_at(event, timestamp)
-        }));
+        trace_packets.extend(
+            events
+                .into_iter()
+                .map(|event| self.event_packet(event.on_track(track_uuid), timestamp)),
+        );
         self.write_packets(trace_packets);
     }
 
-    /// Wraps `event` in a packet timestamped now.
-    fn event_packet(&self, event: idl::TrackEvent) -> idl::TracePacket {
-        self.event_packet_at(event, self.sequence.now())
+    /// Writes `event` on the span track `track_uuid`, timestamped now.
+    ///
+    /// The descriptor of a track that `event` is the first to use, if any, goes in the same
+    /// `Trace` message.
+    fn write_on_span_track(
+        &self,
+        track_uuid: u64,
+        new_track: Option<idl::TrackDescriptor>,
+        event: UnplacedEvent,
+    ) {
+        let mut trace_packets = Vec::with_capacity(2);
+        trace_packets.extend(new_track.map(packets::track_descriptor_packet));
+        trace_packets.push(self.event_packet(event.on_track(track_uuid), self.sequence.now()));
+        self.write_packets(trace_packets);
     }
 
     /// Wraps `event` in a packet of the layer's sequence, timestamped at `timestamp`.
-    fn event_packet_at(&self, event: idl::TrackEvent, timestamp: u64) -> idl::TracePacket {
+    fn event_packet(&self, event: idl::TrackEvent, timestamp: u64) -> idl::TracePacket {
         idl::TracePacket {
             data: Some(idl::trace_packet::Data::TrackEvent(event)),
             ..self.sequence.packet_at(timestamp)
         }
     }
 
-    /// Writes the begin of a new span's lifetime slice and returns where that slice lies.
-    ///
-    /// A new track's descriptor goes in the same `Trace` message as the begin.
+    /// Writes `begin`, the begin of a new span's lifetime slice, and returns where that slice
+    /// lies.
     fn begin_lifetime_slice<S>(
         &self,
         span: &SpanRef<'_, S>,
         own_track_name: Option<&str>,
-        slice_name: &str,
-        correlation_id: u64,
-        debug_annotations: Vec<idl::DebugAnnotation>,
+        begin: UnplacedEvent,
     ) -> LifetimeSlice
     where
         S: for<'a> LookupSpan<'a>,
@@ -303,20 +312,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             self.sequence.process_track_uuid(),
             own_track_name,
         );
-        let mut event = create_event(
-            lifetime.track_uuid,
-            Some(slice_name),
-            span.metadata().file().zip(span.metadata().line()),
-            debug_annotations,
-            idl::track_event::Type::SliceBegin,
-        );
-        event.correlation_id_field = Some(idl::track_event::CorrelationIdField::CorrelationId(
-            correlation_id,
-        ));
-        let mut trace_packets = Vec::with_capacity(2);
-        trace_packets.extend(new_track.map(packets::track_descriptor_packet));
-        trace_packets.push(self.event_packet(event));
-        self.write_packets(trace_packets);
+        self.write_on_span_track(lifetime.track_uuid, new_track, begin);
         lifetime
     }
 }
@@ -369,12 +365,17 @@ where
 
         let correlation_id = packets::unique_uuid();
         let kind = if self.config.span_lifetimes {
+            let begin = UnplacedEvent {
+                event_type: idl::track_event::Type::SliceBegin,
+                name: Some(slice_name.clone()),
+                location: SourceLocation::of(span.metadata()),
+                debug_annotations: debug_annotations.annotations,
+                correlation_id: Some(correlation_id),
+            };
             SpanKind::Lifetime(self.begin_lifetime_slice(
                 &span,
                 naming.track_name.as_deref(),
-                &slice_name,
-                correlation_id,
-                debug_annotations.annotations,
+                begin,
             ))
         } else {
             // Without a lifetime slice to carry them, the creation fields go on every entered
@@ -421,20 +422,17 @@ where
         }
 
         let metadata = event.metadata();
-        let location = metadata.file().zip(metadata.line());
-
         let mut debug_annotations = DebugAnnotations::default();
         if self.config.debug_annotations {
             event.record(&mut debug_annotations);
         }
-
-        let mut track_event = create_event(
-            0,
-            Some(metadata.name()),
-            location,
-            debug_annotations.annotations,
-            idl::track_event::Type::Instant,
-        );
+        let instant = UnplacedEvent {
+            event_type: idl::track_event::Type::Instant,
+            name: Some(Cow::Borrowed(metadata.name())),
+            location: SourceLocation::of(metadata),
+            debug_annotations: debug_annotations.annotations,
+            correlation_id: None,
+        };
 
         // An event belongs to its explicit parent or else the current span, and lands on the
         // track of the nearest such span that this layer records.
@@ -447,12 +445,10 @@ where
                     .map(|lifetime| lifetime.track_uuid)
             })
         });
-        let Some(span_track_uuid) = span_track_uuid else {
-            self.write_on_thread_track(vec![track_event]);
-            return;
-        };
-        track_event.track_uuid = Some(span_track_uuid);
-        self.write_packets(vec![self.event_packet(track_event)]);
+        match span_track_uuid {
+            Some(track_uuid) => self.write_on_span_track(track_uuid, None, instant),
+            None => self.write_on_thread_track(vec![instant]),
+        }
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
@@ -513,16 +509,11 @@ where
             return;
         };
 
-        // The end carries no name or location, because trace processor takes them from the begin
-        // and merges the end's annotations into the slice.
-        let event = create_event(
+        self.write_on_span_track(
             lifetime.track_uuid,
             None,
-            None,
-            span_state.recorded_annotations,
-            idl::track_event::Type::SliceEnd,
+            UnplacedEvent::slice_end(span_state.recorded_annotations),
         );
-        self.write_packets(vec![self.event_packet(event)]);
 
         // Free the parent's track only after writing the end, so a sibling that nests there next
         // begins after it.
