@@ -42,12 +42,12 @@
 //! [Perfetto UI]: https://ui.perfetto.dev
 
 use bytes::BytesMut;
-use idl_helpers::process_descriptor;
 use idl_helpers::{DebugAnnotations, create_event, current_thread_uuid};
 use prost::Message;
+use sequence::TraceSequence;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::Event;
 use tracing::Id;
@@ -58,7 +58,7 @@ use tracing::span;
 use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::registry::{ExtensionsMut, LookupSpan};
 
 #[allow(
     clippy::all,
@@ -75,6 +75,7 @@ mod idl {
 }
 
 mod idl_helpers;
+mod sequence;
 
 pub mod process_memory;
 
@@ -84,13 +85,76 @@ struct PerfettoSpanState {
     trace: idl::Trace, // The Protobuf trace messages that we accumulate for this span.
 }
 
+/// The span states of every [`PerfettoLayer`] on a registry, stored as one span extension.
+///
+/// [`ExtensionsMut::insert`] panics when a span already holds a value of the same type, so the
+/// layers share this container and each one touches only the entry with its own [`LayerId`].
+struct PerfettoSpanStates {
+    entries: Vec<LayerSpanState>,
+}
+
+struct LayerSpanState {
+    layer_id: LayerId,
+    state: PerfettoSpanState,
+}
+
+impl PerfettoSpanStates {
+    /// Adds `state` as the entry of `layer_id`, creating the container on the span's first entry.
+    fn insert(extensions: &mut ExtensionsMut<'_>, layer_id: LayerId, state: PerfettoSpanState) {
+        let entry = LayerSpanState { layer_id, state };
+        if let Some(states) = extensions.get_mut::<Self>() {
+            states.entries.push(entry);
+        } else {
+            extensions.insert(Self {
+                entries: vec![entry],
+            });
+        }
+    }
+
+    fn get(&self, layer_id: LayerId) -> Option<&PerfettoSpanState> {
+        self.entries
+            .iter()
+            .find(|entry| entry.layer_id == layer_id)
+            .map(|entry| &entry.state)
+    }
+
+    fn get_mut(&mut self, layer_id: LayerId) -> Option<&mut PerfettoSpanState> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.layer_id == layer_id)
+            .map(|entry| &mut entry.state)
+    }
+
+    fn remove(&mut self, layer_id: LayerId) -> Option<PerfettoSpanState> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.layer_id == layer_id)?;
+        Some(self.entries.swap_remove(index).state)
+    }
+}
+
+/// Identifies one [`PerfettoLayer`] among all layers in the process.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LayerId(u64);
+
+impl LayerId {
+    fn next() -> Self {
+        static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// A `Layer` that records span as perfetto's
 /// `TYPE_SLICE_BEGIN`/`TYPE_SLICE_END`, and event as `TYPE_INSTANT`.
 ///
 /// `PerfettoLayer` will output the records as encoded [protobuf messages](https://github.com/google/perfetto).
+///
+/// Timestamps come from a monotonic clock that the trace maps onto wall-clock time.
+/// Several layers can share one registry, and each writes a trace that opens on its own.
 pub struct PerfettoLayer<W = fn() -> std::io::Stdout> {
-    sequence_id: SequenceId,
-    process_track_uuid: TrackUuid,
+    layer_id: LayerId,
+    sequence: Arc<TraceSequence>,
     writer: Arc<W>,
     config: Config,
 
@@ -205,8 +269,8 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     #[must_use]
     pub fn new(writer: W) -> Self {
         Self {
-            sequence_id: SequenceId::new(rand::random()),
-            process_track_uuid: TrackUuid::new(rand::random()),
+            layer_id: LayerId::next(),
+            sequence: Arc::new(TraceSequence::new()),
             writer: Arc::new(writer),
             config: Config::default(),
 
@@ -295,13 +359,11 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         W: Send + Sync + 'static,
     {
         let writer = Arc::clone(&self.writer);
-        let process_track_uuid = self.process_track_uuid.get();
-        let sequence_id = self.sequence_id.get();
+        let sequence = Arc::clone(&self.sequence);
         let counter_track_uuid = self.process_memory_rss_track_uuid.get();
         let sampler = ProcessMemorySampler::spawn(ProcessMemorySamplerConfig {
             writer,
-            process_track_uuid,
-            sequence_id,
+            sequence,
             counter_track_uuid,
             interval,
             source,
@@ -321,12 +383,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         if self.lifecycle.is_finished() {
             return;
         }
-        write_trace(
-            self.process_track_uuid.get(),
-            self.writer.as_ref(),
-            log,
-            track_descriptor,
-        );
+        write_trace(&self.sequence, self.writer.as_ref(), log, track_descriptor);
     }
 }
 
@@ -338,8 +395,7 @@ impl<W> Drop for PerfettoLayer<W> {
 
 struct ProcessMemorySamplerConfig<W> {
     writer: Arc<W>,
-    process_track_uuid: u64,
-    sequence_id: u64,
+    sequence: Arc<TraceSequence>,
     counter_track_uuid: u64,
     interval: Duration,
     source: Box<dyn process_memory::ProcessMemorySource>,
@@ -391,18 +447,7 @@ fn write_process_memory_rss_sample<W: PerfettoWriter>(
     rss_bytes: u64,
     include_descriptor: bool,
 ) {
-    let mut packet = idl::TracePacket {
-        trusted_pid: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
-        timestamp: chrono::Local::now()
-            .timestamp_nanos_opt()
-            .map(i64::cast_unsigned),
-        optional_trusted_packet_sequence_id: Some(
-            idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                u32::try_from(config.sequence_id).unwrap_or(u32::MAX),
-            ),
-        ),
-        ..Default::default()
-    };
+    let mut packet = config.sequence.timestamped_packet();
 
     let counter_value = i64::try_from(rss_bytes).unwrap_or(i64::MAX);
     let mut event = idl::TrackEvent {
@@ -420,7 +465,7 @@ fn write_process_memory_rss_sample<W: PerfettoWriter>(
         counter_descriptor.set_unit(idl::counter_descriptor::Unit::SizeBytes);
         idl_helpers::create_track_descriptor(
             Some(config.counter_track_uuid),
-            Some(config.process_track_uuid),
+            Some(config.sequence.process_track_uuid()),
             Some("process.rss"),
             None,
             None,
@@ -429,13 +474,8 @@ fn write_process_memory_rss_sample<W: PerfettoWriter>(
     });
 
     let mut trace = idl::Trace {
-        packet: Vec::with_capacity(3),
+        packet: Vec::with_capacity(2),
     };
-    if include_descriptor {
-        trace
-            .packet
-            .push(process_descriptor(config.process_track_uuid));
-    }
     if let Some(counter_track_descriptor) = counter_track_descriptor {
         trace.packet.push(idl::TracePacket {
             data: Some(idl::trace_packet::Data::TrackDescriptor(
@@ -446,28 +486,18 @@ fn write_process_memory_rss_sample<W: PerfettoWriter>(
     }
     trace.packet.push(packet);
 
-    let mut buf = BytesMut::new();
-    let Ok(()) = trace.encode(&mut buf) else {
-        return;
-    };
-    _ = config.writer.as_ref().write_log(buf);
+    config.sequence.write(config.writer.as_ref(), &trace);
 }
 
 fn write_trace<W: PerfettoWriter>(
-    process_track_uuid: u64,
+    sequence: &TraceSequence,
     writer: &W,
     mut trace: idl::Trace,
     track_descriptor: Option<idl::TrackDescriptor>,
 ) {
-    let mut buf = BytesMut::new();
-
-    trace
-        .packet
-        .insert(0, process_descriptor(process_track_uuid));
-
     if let Some(track_descriptor) = track_descriptor {
         trace.packet.insert(
-            1,
+            0,
             idl::TracePacket {
                 data: Some(idl::trace_packet::Data::TrackDescriptor(track_descriptor)),
                 ..Default::default()
@@ -475,23 +505,7 @@ fn write_trace<W: PerfettoWriter>(
         );
     }
 
-    let Ok(()) = trace.encode(&mut buf) else {
-        return;
-    };
-
-    _ = writer.write_log(buf);
-}
-
-struct SequenceId(u64);
-
-impl SequenceId {
-    fn new(n: u64) -> Self {
-        Self(n)
-    }
-
-    fn get(&self) -> u64 {
-        self.0
-    }
+    sequence.write(writer, &trace);
 }
 
 struct TrackUuid(u64);
@@ -607,7 +621,7 @@ where
             attrs.record(&mut debug_annotations);
         }
 
-        let mut packet = idl::TracePacket::default();
+        let mut packet = self.sequence.timestamped_packet();
 
         // check if parent span has a non default track descriptor
         let inherited_track_descriptor = span
@@ -616,7 +630,8 @@ where
             .and_then(|parent_span| {
                 parent_span
                     .extensions()
-                    .get::<PerfettoSpanState>()
+                    .get::<PerfettoSpanStates>()
+                    .and_then(|states| states.get(self.layer_id))
                     .map(|state| state.track_descriptor.clone())
             })
             .flatten();
@@ -641,7 +656,7 @@ where
                 static_or_dynamic_name: Some(idl::track_descriptor::StaticOrDynamicName::Name(
                     name.to_string(),
                 )),
-                ..idl::TrackDescriptor::named_child_for(name, self.process_track_uuid.get())
+                ..idl::TrackDescriptor::named_child_for(name, self.sequence.process_track_uuid())
             })
             .or(inherited_track_descriptor);
 
@@ -657,15 +672,6 @@ where
             Some(idl::track_event::Type::SliceBegin),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
-        packet.timestamp = chrono::Local::now()
-            .timestamp_nanos_opt()
-            .map(i64::cast_unsigned);
-        packet.trusted_pid = Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX));
-        packet.optional_trusted_packet_sequence_id = Some(
-            idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                u32::try_from(self.sequence_id.get()).unwrap_or(u32::MAX),
-            ),
-        );
 
         let span_state = PerfettoSpanState {
             track_descriptor: span_track_descriptor,
@@ -678,7 +684,7 @@ where
                 packet: vec![packet],
             },
         };
-        span.extensions_mut().insert(span_state);
+        PerfettoSpanStates::insert(&mut span.extensions_mut(), self.layer_id, span_state);
     }
 
     fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
@@ -689,7 +695,8 @@ where
         // We don't check the filter here -- we've already checked it when we handled the span on
         // `on_new_span`. Iff we successfully attached a track packet to the span, then we'll also
         // update the trace packet with the debug data here.
-        if let Some(extension) = span.extensions_mut().get_mut::<PerfettoSpanState>()
+        if let Some(states) = span.extensions_mut().get_mut::<PerfettoSpanStates>()
+            && let Some(extension) = states.get_mut(self.layer_id)
             && let Some(packet) = extension.trace.packet.get_mut(0)
             && let Some(idl::trace_packet::Data::TrackEvent(event)) = &mut packet.data
         {
@@ -730,21 +737,11 @@ where
             Some(idl::track_event::Type::Instant),
         );
 
-        let mut packet = idl::TracePacket {
-            trusted_pid: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
-            timestamp: chrono::Local::now()
-                .timestamp_nanos_opt()
-                .map(i64::cast_unsigned),
-            optional_trusted_packet_sequence_id: Some(
-                idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                    u32::try_from(self.sequence_id.get()).unwrap_or(u32::MAX),
-                ),
-            ),
-            ..Default::default()
-        };
+        let mut packet = self.sequence.timestamped_packet();
 
         if let Some(span) = ctx.event_span(event)
-            && let Some(span_state) = span.extensions_mut().get_mut::<PerfettoSpanState>()
+            && let Some(states) = span.extensions_mut().get_mut::<PerfettoSpanStates>()
+            && let Some(span_state) = states.get_mut(self.layer_id)
         {
             track_event.track_uuid = span_state
                 .track_descriptor
@@ -770,7 +767,11 @@ where
             return;
         };
 
-        let Some(mut span_state) = span.extensions_mut().remove::<PerfettoSpanState>() else {
+        let Some(mut span_state) = span
+            .extensions_mut()
+            .get_mut::<PerfettoSpanStates>()
+            .and_then(|states| states.remove(self.layer_id))
+        else {
             return;
         };
 
@@ -781,7 +782,7 @@ where
             .as_ref()
             .map_or_else(current_thread_uuid, idl::TrackDescriptor::uuid);
 
-        let mut packet = idl::TracePacket::default();
+        let mut packet = self.sequence.timestamped_packet();
         let meta = span.metadata();
         let slice_name = span_state
             .slice_name
@@ -796,15 +797,6 @@ where
             Some(idl::track_event::Type::SliceEnd),
         );
         packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
-        packet.timestamp = chrono::Local::now()
-            .timestamp_nanos_opt()
-            .map(i64::cast_unsigned);
-        packet.trusted_pid = Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX));
-        packet.optional_trusted_packet_sequence_id = Some(
-            idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
-                u32::try_from(self.sequence_id.get()).unwrap_or(u32::MAX),
-            ),
-        );
 
         span_state.trace.packet.push(packet);
 
@@ -886,10 +878,14 @@ mod tests {
     use crate::PerfettoLayer;
     use crate::idl;
     use crate::idl::track_event;
+    use crate::sequence::SEQUENCE_CLOCK_ID;
     use googletest::prelude::*;
     use parking_lot::Mutex;
     use prost::Message;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use tracing::{field, trace_span};
     use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
@@ -1186,5 +1182,579 @@ mod tests {
             "expected the span before finishing to be written"
         );
         expect_eq!(extra_writer.buf.lock().len(), written);
+    }
+
+    /// A memory source that reports samples once armed and announces each sample it reports.
+    ///
+    /// The sampler writes a sample before it reads the next one, so the second announcement
+    /// proves that the first sample reached the writer.
+    struct AnnouncingProcessMemory {
+        armed: Arc<AtomicBool>,
+        announcements: mpsc::Sender<()>,
+    }
+
+    impl crate::process_memory::ProcessMemorySource for AnnouncingProcessMemory {
+        fn resident_set_size_bytes(&self) -> Option<u64> {
+            if !self.armed.load(Ordering::Acquire) {
+                return None;
+            }
+            // The receiver is gone only after the test stopped waiting for samples.
+            self.announcements.send(()).ok();
+            Some(1024)
+        }
+    }
+
+    /// Blocks until the sampler has written at least one sample.
+    fn wait_for_written_sample(announcements: &mpsc::Receiver<()>) -> Result<()> {
+        announcements.recv().or_fail()?;
+        announcements.recv().or_fail()
+    }
+
+    fn is_process_descriptor(packet: &idl::TracePacket) -> bool {
+        matches!(
+            &packet.data,
+            Some(idl::trace_packet::Data::TrackDescriptor(descriptor)) if descriptor.process.is_some()
+        )
+    }
+
+    fn is_clock_snapshot(packet: &idl::TracePacket) -> bool {
+        matches!(packet.data, Some(idl::trace_packet::Data::ClockSnapshot(_)))
+    }
+
+    fn is_counter_event(packet: &idl::TracePacket) -> bool {
+        matches!(
+            &packet.data,
+            Some(idl::trace_packet::Data::TrackEvent(event))
+                if event.r#type() == track_event::Type::Counter
+        )
+    }
+
+    fn sequence_id(packet: &idl::TracePacket) -> Option<u32> {
+        let idl::trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(id) =
+            packet.optional_trusted_packet_sequence_id?;
+        Some(id)
+    }
+
+    /// Checks that `trace` opens with its preamble and never repeats it.
+    ///
+    /// The preamble is the process track descriptor followed by the clock snapshot that maps the
+    /// sequence clock onto the wall clock.
+    fn expect_preamble_once(trace: &idl::Trace) -> Result<()> {
+        let [descriptor, snapshot, ..] = trace.packet.as_slice() else {
+            return fail!("expected a preamble, got {} packets", trace.packet.len());
+        };
+        expect_true!(is_process_descriptor(descriptor));
+        let Some(idl::trace_packet::Data::ClockSnapshot(snapshot_data)) = &snapshot.data else {
+            return fail!("expected a clock snapshot after the process descriptor");
+        };
+
+        // The snapshot pairs the sequence clock with the wall clock, which is the trace clock.
+        let realtime_clock_id = u32::try_from(i32::from(idl::BuiltinClock::Realtime)).or_fail()?;
+        let clock_ids: Vec<_> = snapshot_data
+            .clocks
+            .iter()
+            .map(|clock| clock.clock_id)
+            .collect();
+        expect_eq!(
+            clock_ids,
+            vec![Some(SEQUENCE_CLOCK_ID), Some(realtime_clock_id)]
+        );
+        expect_eq!(
+            snapshot_data.primary_trace_clock,
+            Some(i32::from(idl::BuiltinClock::Realtime))
+        );
+        // The user-defined clock is scoped to the snapshot's sequence.
+        expect_true!(sequence_id(snapshot).is_some());
+
+        // Later writes reuse the preamble instead of repeating it.
+        let process_descriptors = trace
+            .packet
+            .iter()
+            .filter(|packet| is_process_descriptor(packet))
+            .count();
+        let clock_snapshots = trace
+            .packet
+            .iter()
+            .filter(|packet| is_clock_snapshot(packet))
+            .count();
+        expect_eq!(process_descriptors, 1);
+        expect_eq!(clock_snapshots, 1);
+        Ok(())
+    }
+
+    /// Checks that every timestamped packet reads the sequence clock that the preamble defines.
+    fn expect_sequence_clock(trace: &idl::Trace) {
+        let clock_ids: Vec<_> = trace
+            .packet
+            .iter()
+            .filter(|packet| packet.timestamp.is_some())
+            .map(|packet| packet.timestamp_clock_id)
+            .collect();
+        expect_that!(clock_ids, not(is_empty()));
+        expect_that!(clock_ids, each(eq(&Some(SEQUENCE_CLOCK_ID))));
+    }
+
+    /// Checks that every track an event or descriptor refers to is described in `trace` itself.
+    fn expect_self_contained(trace: &idl::Trace) {
+        let mut described = HashSet::new();
+        let mut referenced = HashSet::new();
+        for packet in &trace.packet {
+            match &packet.data {
+                Some(idl::trace_packet::Data::TrackDescriptor(descriptor)) => {
+                    described.insert(descriptor.uuid());
+                    referenced.extend(descriptor.parent_uuid);
+                }
+                Some(idl::trace_packet::Data::TrackEvent(event)) => {
+                    referenced.extend(event.track_uuid);
+                }
+                _ => {}
+            }
+        }
+        expect_that!(referenced, not(is_empty()));
+        let undescribed: Vec<_> = referenced.difference(&described).collect();
+        expect_that!(undescribed, is_empty());
+    }
+
+    /// Returns the calling thread's kernel ID from the first field of its procfs `stat` file.
+    ///
+    /// This source is independent of the `/proc/thread-self` link that the layer reads.
+    #[cfg(target_os = "linux")]
+    fn procfs_kernel_thread_id() -> Result<i32> {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").or_fail()?;
+        stat.split_whitespace().next().or_fail()?.parse().or_fail()
+    }
+
+    /// Runs `record` under `dispatch` and returns the calling thread's kernel ID.
+    ///
+    /// The ID is `None` on platforms where the test has no source for the kernel's thread ID.
+    fn record_on_current_thread(
+        dispatch: &tracing::Dispatch,
+        record: impl FnOnce(),
+    ) -> Result<Option<i32>> {
+        tracing::dispatcher::with_default(dispatch, record);
+        #[cfg(target_os = "linux")]
+        let kernel_thread_id = Some(procfs_kernel_thread_id()?);
+        // `thread_id::get` is `pthread_threadid_np` on macOS and `GetCurrentThreadId` on Windows.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let kernel_thread_id = Some(i32::try_from(thread_id::get()).or_fail()?);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let kernel_thread_id = None::<i32>;
+        Ok(kernel_thread_id)
+    }
+
+    fn new_announcing_layer(
+        writer: TestWriter,
+        armed: bool,
+    ) -> (
+        PerfettoLayer<TestWriter>,
+        Arc<AtomicBool>,
+        mpsc::Receiver<()>,
+    ) {
+        let armed = Arc::new(AtomicBool::new(armed));
+        let (announcements_sender, announcements) = mpsc::channel();
+        let layer = PerfettoLayer::new(writer).with_process_memory_source(
+            std::time::Duration::ZERO,
+            Box::new(AnnouncingProcessMemory {
+                armed: Arc::clone(&armed),
+                announcements: announcements_sender,
+            }),
+        );
+        (layer, armed, announcements)
+    }
+
+    /// Thread descriptors carry each thread's own OS thread ID.
+    ///
+    /// On Linux, `thread_id::get` is a `pthread_t` address, which clamped to `i32` gives every
+    /// thread the same ID and merges all thread tracks of the process into one.
+    #[gtest]
+    fn thread_descriptors_carry_the_os_thread_id_of_each_thread() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(PerfettoLayer::new(writer)));
+
+        // Record one span on the test thread and one on a worker thread.
+        let main_kernel_thread_id = record_on_current_thread(&dispatch, || {
+            trace_span!("main_thread_span").in_scope(|| {});
+        })?;
+        let worker_kernel_thread_id = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    record_on_current_thread(&dispatch, || {
+                        trace_span!("worker_thread_span").in_scope(|| {});
+                    })
+                })
+                .join()
+        })
+        .or_fail()??;
+
+        // Map each span to the thread ID of the track its slice begins on.
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+        let thread_ids: HashMap<u64, Option<i32>> = trace
+            .packet
+            .iter()
+            .filter_map(|packet| match &packet.data {
+                Some(idl::trace_packet::Data::TrackDescriptor(descriptor)) => descriptor
+                    .thread
+                    .as_ref()
+                    .map(|thread| (descriptor.uuid(), thread.tid)),
+                _ => None,
+            })
+            .collect();
+        let span_thread_id = |span_name: &str| {
+            trace.packet.iter().find_map(|packet| match &packet.data {
+                Some(idl::trace_packet::Data::TrackEvent(event))
+                    if event.name_field
+                        == Some(track_event::NameField::Name(span_name.to_string())) =>
+                {
+                    thread_ids.get(&event.track_uuid()).copied().flatten()
+                }
+                _ => None,
+            })
+        };
+        let main_thread_id = span_thread_id("main_thread_span").or_fail()?;
+        let worker_thread_id = span_thread_id("worker_thread_span").or_fail()?;
+
+        // Each thread track names its own, valid thread.
+        expect_ne!(main_thread_id, worker_thread_id);
+        expect_that!(main_thread_id, gt(0));
+        expect_that!(worker_thread_id, gt(0));
+
+        // Where the kernel's ID is known, the descriptors carry exactly that ID, so the tracks
+        // line up with other tools' view of the threads.
+        if let (Some(main_kernel_thread_id), Some(worker_kernel_thread_id)) =
+            (main_kernel_thread_id, worker_kernel_thread_id)
+        {
+            expect_eq!(main_thread_id, main_kernel_thread_id);
+            expect_eq!(worker_thread_id, worker_kernel_thread_id);
+        }
+        Ok(())
+    }
+
+    /// Spans, unscoped events and memory samples of one layer all share one valid sequence ID.
+    ///
+    /// A random `u64` clamped to `u32` is `u32::MAX` for all but a 2^-32 share of layers, so
+    /// every layer would share that one sequence and its sequence-scoped clock.
+    #[gtest]
+    fn packets_of_one_layer_share_one_valid_sequence_id() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let (perfetto_layer, _, announcements) = new_announcing_layer(writer, true);
+        let finish = perfetto_layer.finish_handle();
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        trace_span!("span").in_scope(|| tracing::info!("inside the span"));
+        tracing::info!("outside any span");
+        wait_for_written_sample(&announcements)?;
+        finish.finish();
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+
+        // Every timestamped packet, the memory samples included, names a sequence.
+        let timestamped_sequence_ids: Vec<_> = trace
+            .packet
+            .iter()
+            .filter(|packet| packet.timestamp.is_some())
+            .map(sequence_id)
+            .collect();
+        expect_that!(timestamped_sequence_ids, each(some(anything())));
+        expect_true!(trace.packet.iter().any(is_counter_event));
+
+        // All packets name the same sequence, which is not invalid, not the tracing service's
+        // own, and not a clamped value.
+        let sequence_ids: HashSet<u32> = trace.packet.iter().filter_map(sequence_id).collect();
+        let [only_sequence_id] = sequence_ids.iter().copied().collect::<Vec<_>>()[..] else {
+            return fail!("expected one sequence ID, got {sequence_ids:?}");
+        };
+        expect_that!(only_sequence_id, all!(gt(1), lt(u32::MAX)));
+        Ok(())
+    }
+
+    /// Two layers on one registry each record the same spans into their own complete trace.
+    ///
+    /// Span extensions hold one value per type, so a layer that stored its state as its own
+    /// extension type would panic when the second layer inserted the same type.
+    #[gtest]
+    fn two_layers_on_one_registry_each_write_a_complete_trace() -> Result<()> {
+        let first_writer = TestWriter::new();
+        let first_buf = first_writer.make_writer();
+        let second_writer = TestWriter::new();
+        let second_buf = second_writer.make_writer();
+        let subscriber = tracing_subscriber::registry()
+            .with(PerfettoLayer::new(first_writer).with_debug_annotations(true))
+            .with(PerfettoLayer::new(second_writer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // A named parent makes the child read its track from the parent's per-layer state, and
+        // the recorded field and the event each update only the recording layer's state.
+        trace_span!(
+            "parent",
+            { "perfetto.track_name" } = "jobs",
+            value = field::Empty
+        )
+        .in_scope(|| {
+            tracing::Span::current().record("value", 1);
+            trace_span!("child").in_scope(|| tracing::info!("inside the child"));
+        });
+
+        let first = idl::Trace::decode(first_buf.buf.lock().as_slice()).or_fail()?;
+        let second = idl::Trace::decode(second_buf.buf.lock().as_slice()).or_fail()?;
+        for trace in [&first, &second] {
+            expect_preamble_once(trace)?;
+            expect_self_contained(trace);
+
+            // Both spans begin and end, and the event inside the child is recorded once.
+            let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
+            let (event_names, mut span_names): (Vec<_>, Vec<_>) = names
+                .into_iter()
+                .partition(|name| name.starts_with("event "));
+            span_names.sort();
+            expect_eq!(span_names, ["child", "child", "parent", "parent"]);
+            expect_eq!(event_names.len(), 1);
+        }
+
+        // Each layer writes on its own sequence.
+        let first_ids: HashSet<u32> = first.packet.iter().filter_map(sequence_id).collect();
+        let second_ids: HashSet<u32> = second.packet.iter().filter_map(sequence_id).collect();
+        expect_that!(first_ids.intersection(&second_ids).count(), eq(0));
+        Ok(())
+    }
+
+    /// Every timestamped packet reads the sequence clock that one earlier snapshot maps onto the
+    /// wall clock.
+    ///
+    /// A packet without a clock ID is read as boot time, so elapsed nanoseconds since the layer's
+    /// epoch would land decades before the snapshot's wall-clock time.
+    #[gtest]
+    fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let (perfetto_layer, _, announcements) = new_announcing_layer(writer, true);
+        let finish = perfetto_layer.finish_handle();
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Cover every write path: span close, unscoped event and memory sample.
+        trace_span!("span").in_scope(|| tracing::info!("inside the span"));
+        tracing::info!("outside any span");
+        wait_for_written_sample(&announcements)?;
+        finish.finish();
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+
+        // Exactly one snapshot defines the clock, and it precedes every packet that reads it.
+        let snapshot_positions: Vec<usize> = trace
+            .packet
+            .iter()
+            .enumerate()
+            .filter(|(_, packet)| is_clock_snapshot(packet))
+            .map(|(position, _)| position)
+            .collect();
+        let [snapshot_position] = snapshot_positions[..] else {
+            return fail!("expected one clock snapshot, got {snapshot_positions:?}");
+        };
+        let first_timestamped_position = trace
+            .packet
+            .iter()
+            .position(|packet| packet.timestamp.is_some())
+            .or_fail()?;
+        expect_that!(snapshot_position, lt(first_timestamped_position));
+
+        // The snapshot pairs the sequence clock with the wall clock on the packets' sequence.
+        let snapshot = trace.packet.get(snapshot_position).or_fail()?;
+        let Some(idl::trace_packet::Data::ClockSnapshot(snapshot_data)) = &snapshot.data else {
+            return fail!("expected a clock snapshot at {snapshot_position}");
+        };
+        let realtime_clock_id = u32::try_from(i32::from(idl::BuiltinClock::Realtime)).or_fail()?;
+        let clock_ids: Vec<_> = snapshot_data
+            .clocks
+            .iter()
+            .map(|clock| clock.clock_id)
+            .collect();
+        expect_eq!(
+            clock_ids,
+            vec![Some(SEQUENCE_CLOCK_ID), Some(realtime_clock_id)]
+        );
+        expect_that!(
+            snapshot_data
+                .clocks
+                .iter()
+                .map(|clock| clock.timestamp)
+                .collect::<Vec<_>>(),
+            each(some(gt(&0)))
+        );
+        expect_eq!(
+            snapshot_data.primary_trace_clock,
+            Some(i32::from(idl::BuiltinClock::Realtime))
+        );
+        let first_timestamped = trace.packet.get(first_timestamped_position).or_fail()?;
+        expect_eq!(sequence_id(snapshot), sequence_id(first_timestamped));
+
+        // Every timestamped packet, span, event and sample alike, reads that clock.
+        expect_sequence_clock(&trace);
+        expect_true!(trace.packet.iter().any(is_counter_event));
+        Ok(())
+    }
+
+    /// Sequentially recorded spans and events are written with non-decreasing timestamps.
+    ///
+    /// The timestamps come from a monotonic clock, so a wall-clock adjustment cannot reorder
+    /// slices.
+    #[gtest]
+    fn sequential_packets_have_non_decreasing_timestamps() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Spans are buffered until they close, so only unnested spans are written in time order.
+        for _ in 0..3 {
+            trace_span!("span").in_scope(|| tracing::info!("inside the span"));
+            tracing::info!("outside any span");
+        }
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+        expect_sequence_clock(&trace);
+        let timestamps: Vec<u64> = trace
+            .packet
+            .iter()
+            .filter_map(|packet| packet.timestamp)
+            .collect();
+        let mut sorted_timestamps = timestamps.clone();
+        sorted_timestamps.sort_unstable();
+        // Each iteration writes a slice begin, an instant and a slice end, then another instant.
+        expect_eq!(timestamps.len(), 12);
+        expect_eq!(timestamps, sorted_timestamps);
+        Ok(())
+    }
+
+    /// The process descriptor and clock snapshot open the trace and appear once across writes.
+    ///
+    /// Repeating the process descriptor on every write would duplicate it once per span and
+    /// event.
+    #[gtest]
+    fn preamble_is_written_once_across_many_writes() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Each closed span and each unscoped event is a separate write.
+        for _ in 0..3 {
+            trace_span!("span").in_scope(|| {});
+            tracing::info!("outside any span");
+        }
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+        expect_preamble_once(&trace)?;
+        let slice_begins = trace
+            .packet
+            .iter()
+            .filter(|packet| {
+                matches!(
+                    &packet.data,
+                    Some(idl::trace_packet::Data::TrackEvent(event))
+                        if event.r#type() == track_event::Type::SliceBegin
+                )
+            })
+            .count();
+        expect_eq!(slice_begins, 3);
+        Ok(())
+    }
+
+    /// The preamble precedes everything when the memory sampler writes before any span closes.
+    ///
+    /// A sampler that wrote its samples without the preamble would put them ahead of the clock
+    /// snapshot that defines their clock.
+    #[gtest]
+    fn preamble_precedes_a_memory_sample_written_first() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let (perfetto_layer, _, announcements) = new_announcing_layer(writer, true);
+        let finish = perfetto_layer.finish_handle();
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // The sampler writes first, then a span and an unscoped event follow.
+        wait_for_written_sample(&announcements)?;
+        trace_span!("span").in_scope(|| {});
+        tracing::info!("outside any span");
+        finish.finish();
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+        expect_preamble_once(&trace)?;
+        expect_sequence_clock(&trace);
+        // The sample's counter track descriptor is the first packet after the preamble.
+        expect_true!(trace.packet.get(2).is_some_and(|packet| matches!(
+            &packet.data,
+            Some(idl::trace_packet::Data::TrackDescriptor(descriptor))
+                if descriptor.counter.is_some()
+        )));
+        Ok(())
+    }
+
+    /// The preamble precedes everything when a span closes before the memory sampler writes.
+    ///
+    /// A preamble written only by the sampler would follow the span's packets.
+    #[gtest]
+    fn preamble_precedes_a_span_written_first() -> Result<()> {
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let (perfetto_layer, armed, announcements) = new_announcing_layer(writer, false);
+        let finish = perfetto_layer.finish_handle();
+        let subscriber = tracing_subscriber::registry().with(perfetto_layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // The disarmed sampler skips its intervals until the span has been written.
+        trace_span!("span").in_scope(|| {});
+        armed.store(true, Ordering::Release);
+        wait_for_written_sample(&announcements)?;
+        finish.finish();
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+        expect_preamble_once(&trace)?;
+        expect_sequence_clock(&trace);
+        expect_true!(trace.packet.iter().any(is_counter_event));
+        Ok(())
+    }
+
+    /// First writes racing on several threads and the sampler all land after the preamble.
+    ///
+    /// Concurrent first writers wait for the one writing the preamble, so none of them can
+    /// write a packet between the preamble's start and its end.
+    #[gtest]
+    fn concurrent_first_writes_all_follow_the_preamble() -> Result<()> {
+        const THREADS: usize = 8;
+        let writer = TestWriter::new();
+        let extra_writer = writer.make_writer();
+        let (perfetto_layer, armed, announcements) = new_announcing_layer(writer, false);
+        let finish = perfetto_layer.finish_handle();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(perfetto_layer));
+
+        // Release every thread's first span close and the sampler's first sample together.
+        let start = std::sync::Barrier::new(THREADS + 1);
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let span = trace_span!("racing_span");
+                        start.wait();
+                        drop(span);
+                    });
+                });
+            }
+            start.wait();
+            armed.store(true, Ordering::Release);
+        });
+        wait_for_written_sample(&announcements)?;
+        finish.finish();
+
+        let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+        expect_preamble_once(&trace)?;
+        expect_sequence_clock(&trace);
+        let names = crate::decode_track_event_names(&trace.encode_to_vec()).or_fail()?;
+        expect_eq!(names.len(), 2 * THREADS);
+        Ok(())
     }
 }
