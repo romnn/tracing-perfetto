@@ -730,6 +730,48 @@ fn span_entered_at_thread_exit_keeps_an_unfinished_slice() -> Result<()> {
     Ok(())
 }
 
+/// A thread keeps per-thread state only of layers that are still alive once another layer
+/// records on it.
+///
+/// A long-lived thread that records through many short-lived layers, such as one trace file per
+/// job, would otherwise keep an entry per dropped layer and scan them all on every entry and
+/// exit.
+#[gtest]
+fn thread_drops_the_state_of_dropped_layers() -> Result<()> {
+    const DROPPED_LAYERS: usize = 8;
+    let live_layer_counts = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // Each layer records on the thread and is dropped.
+                for _ in 0..DROPPED_LAYERS {
+                    let (layer, _output) = annotated_layer();
+                    let subscriber = tracing_subscriber::registry().with(layer);
+                    tracing::subscriber::with_default(subscriber, || {
+                        trace_span!("job").in_scope(|| {});
+                    });
+                }
+                let after_dropped = crate::thread_state::current_thread_layer_count();
+
+                // A live layer recording on the thread removes the dropped layers' entries.
+                let (layer, _output) = annotated_layer();
+                let subscriber = tracing_subscriber::registry().with(layer);
+                tracing::subscriber::with_default(subscriber, || {
+                    trace_span!("job").in_scope(|| {});
+                    [
+                        after_dropped,
+                        crate::thread_state::current_thread_layer_count(),
+                    ]
+                })
+            })
+            .join()
+    })
+    .or_fail()?;
+
+    // Each new layer removes the entry of the one before it, and the live one stays.
+    expect_eq!(live_layer_counts, [1, 1]);
+    Ok(())
+}
+
 /// Two layers on one registry each keep their own stack of entered spans.
 ///
 /// A stack shared by the layers would let one layer's exit match the other layer's entry, so a
