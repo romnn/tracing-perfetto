@@ -163,6 +163,8 @@ panic unwinds is caught, since a second panic there aborts the process.
   holding the lock that every write of the trace takes, which their writes cannot wait for.
   This holds only for the writer's own layer, so a writer must not record into another
   tracing-perfetto layer, whose writer may wait for this one in the same way.
+  Nor may a writer enter, exit or drop spans that the application created, since their begin or
+  end would be dropped and their slices would not balance.
 - The writer may call `finish()` from inside its own write, on the thread that the layer calls
   it on, which returns at once and ends the trace when that write returns, but it must not wait
   for a `finish()` on another thread, including one that it spawns and joins, which waits for the
