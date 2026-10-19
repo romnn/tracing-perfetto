@@ -169,6 +169,7 @@ impl FinishHandle {
     /// The caller must not hold anything that the writer or the process-memory source needs,
     /// such as the `Mutex` of a `Mutex<W>` writer, because this waits for the write in progress
     /// and for the sample being read, and then flushes the writer on the calling thread.
+    /// The same holds for dropping the layer, which ends the trace the same way.
     ///
     /// Dropping the layer ends the trace and flushes the writer too, but only this reports an
     /// error.

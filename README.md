@@ -159,9 +159,9 @@ write, and `finish()` returns the error, or else an error of the flush.
   it on, which returns at once and ends the trace when that write returns, but it must not wait
   for a `finish()` on another thread, including one that it spawns and joins, which waits for the
   write in progress.
-- Do not call `finish()` while holding the writer's lock, such as the `Mutex` of a
-  `Mutex<BufWriter<File>>`, or anything else the writer or the process-memory source needs,
-  because `finish()` waits for the write in progress and then flushes the writer itself.
+- Do not call `finish()` or drop the layer while holding the writer's lock, such as the `Mutex`
+  of a `Mutex<BufWriter<File>>`, or anything else the writer or the process-memory source needs,
+  because both wait for the write in progress and then flush the writer themselves.
 
 ## Known limitations
 
