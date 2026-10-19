@@ -320,3 +320,38 @@ fn zero_interval_samples_at_most_once_per_millisecond() -> Result<()> {
     drop(layer);
     Ok(())
 }
+
+/// The sampler raises intervals below one millisecond to exactly one millisecond and keeps
+/// longer ones.
+///
+/// The expected values are literals, so the test fails if the minimum disappears or changes,
+/// which a test comparing against the production constant would not notice.
+#[gtest]
+fn sampling_interval_is_at_least_one_millisecond() {
+    use crate::process_memory::sampler::sampling_interval;
+
+    // Raised to the minimum
+    expect_eq!(sampling_interval(Duration::ZERO), Duration::from_millis(1));
+    expect_eq!(
+        sampling_interval(Duration::from_nanos(1)),
+        Duration::from_millis(1)
+    );
+    expect_eq!(
+        sampling_interval(Duration::from_micros(999)),
+        Duration::from_millis(1)
+    );
+
+    // Kept as requested
+    expect_eq!(
+        sampling_interval(Duration::from_millis(1)),
+        Duration::from_millis(1)
+    );
+    expect_eq!(
+        sampling_interval(Duration::from_micros(1_001)),
+        Duration::from_micros(1_001)
+    );
+    expect_eq!(
+        sampling_interval(Duration::from_secs(3600)),
+        Duration::from_secs(3600)
+    );
+}
