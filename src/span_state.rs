@@ -5,6 +5,11 @@
 //! [`place_span`] claims the parent's track and [`LifetimeSlice::close`] frees it, and because a
 //! child always closes before its parent, the parent's slice is then the innermost open slice on
 //! that track.
+//! That order holds only while spans close under their own dispatcher: a child that closes under
+//! another default dispatcher releases its parent through that dispatcher, which can leave the
+//! parent open or close an unrelated span of the same ID in another registry ([#9]).
+//!
+//! [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 
 use crate::packets::{SourceLocation, UnplacedEvent};
 use crate::{idl, packets};
