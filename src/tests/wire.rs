@@ -273,6 +273,7 @@ fn thread_descriptors_carry_the_os_thread_id_of_each_thread() -> Result<()> {
 }
 
 /// A thread that reports a given kernel thread ID in place of its own.
+#[derive(Clone, Copy)]
 struct ThreadWithKernelId {
     /// The name of the thread, which its track takes.
     name: &'static str,
@@ -374,6 +375,40 @@ fn threads_without_a_kernel_thread_id_get_distinct_tracks_without_a_thread_id() 
     expect_that!(second.thread, none());
     expect_that!(first.parent_uuid, some(eq(process_track)));
     expect_that!(second.parent_uuid, some(eq(process_track)));
+    Ok(())
+}
+
+/// Same-named threads without a kernel thread ID get tracks that never merge with their siblings.
+///
+/// Such a track is a child of the process track, and trace processor merges sibling tracks of the
+/// same name by default, so the threads of a pool, all named `worker`, would share one track.
+#[gtest]
+fn same_named_threads_without_a_kernel_thread_id_get_tracks_that_never_merge() -> Result<()> {
+    let worker = ThreadWithKernelId {
+        name: "worker",
+        kernel_thread_id: None,
+    };
+    let trace = record_on_threads_with_kernel_ids(&[worker, worker])?;
+    let descriptors: Vec<_> = trace
+        .packet
+        .iter()
+        .filter_map(crate::tests::track_descriptor)
+        .filter(|descriptor| crate::tests::track_name(descriptor) == Some("worker"))
+        .collect();
+    let [first, second] = descriptors[..] else {
+        return Err(format!(
+            "expected two tracks named \"worker\", got {descriptors:?}"
+        ))
+        .or_fail();
+    };
+
+    expect_ne!(first.uuid(), second.uuid());
+    for descriptor in [first, second] {
+        expect_eq!(
+            descriptor.sibling_merge_behavior(),
+            idl::track_descriptor::SiblingMergeBehavior::None
+        );
+    }
     Ok(())
 }
 

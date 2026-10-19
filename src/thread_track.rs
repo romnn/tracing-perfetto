@@ -37,6 +37,8 @@ pub(crate) fn current_thread_uuid() -> u64 {
 /// Otherwise it is a track below the process track `process_track_uuid`: a thread descriptor
 /// identifies its thread by the process and thread IDs alone, so a made-up ID would claim
 /// another thread, and trace processor would merge the tracks of every thread sharing it.
+/// Such a track also never merges with its siblings: trace processor merges sibling tracks of the
+/// same name by default, and the threads of a pool share one name.
 pub(crate) fn current_thread_track_descriptor(process_track_uuid: u64) -> idl::TrackDescriptor {
     let thread_name = std::thread::current().name().map(ToString::to_string);
     let pid = i32::try_from(std::process::id()).ok();
@@ -48,11 +50,14 @@ pub(crate) fn current_thread_track_descriptor(process_track_uuid: u64) -> idl::T
             thread_name: thread_name.clone(),
             ..Default::default()
         });
+    let fallback = thread.is_none();
     idl::TrackDescriptor {
         uuid: Some(current_thread_uuid()),
         static_or_dynamic_name: thread_name.as_deref().map(packets::track_name),
         // A thread track belongs to its process through its thread descriptor.
-        parent_uuid: thread.is_none().then_some(process_track_uuid),
+        parent_uuid: fallback.then_some(process_track_uuid),
+        sibling_merge_behavior: fallback
+            .then_some(idl::track_descriptor::SiblingMergeBehavior::None.into()),
         thread,
         ..Default::default()
     }

@@ -25,7 +25,8 @@
 //! links them across threads.
 //! A thread's track is the thread track of its kernel thread ID.
 //! Where that ID is unknown, as on Linux without procfs, the track is named after the thread and
-//! sits below the process track instead, so it never claims another thread's ID.
+//! sits below the process track instead, so it never claims another thread's ID or merges with
+//! another thread's track.
 //!
 //! The Perfetto UI merges tracks of the same name into one visual track, with a lane for each
 //! span that is open at the same time.

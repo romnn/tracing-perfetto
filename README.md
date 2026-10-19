@@ -72,7 +72,8 @@ In the Perfetto UI, spans and events appear on these tracks below the process:
   which links them across threads.
 - A thread's track is the thread track of its kernel thread ID.
   Where that ID is unknown, as on Linux without procfs, the track is named after the thread and
-  sits below the process track instead, so it never claims another thread's ID.
+  sits below the process track instead, so it never claims another thread's ID or merges with
+  another thread's track.
 
 `with_thread_slices(false)` turns entered slices off.
 `with_span_lifetimes(false)` turns lifetime slices off, which leaves a synchronous program a plain
