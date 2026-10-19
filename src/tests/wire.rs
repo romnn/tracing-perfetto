@@ -305,6 +305,35 @@ fn unique_ids_are_nonzero_and_never_repeat() -> Result<()> {
     Ok(())
 }
 
+/// Processes with different IDs draw different IDs from the same counter and hash keys, as a
+/// forked child does from the state it copied from its parent.
+///
+/// A seed fixed when the parent drew its first ID would carry over into the child, which would
+/// then draw the parent's next IDs, so both traces would describe and use the same track UUIDs.
+#[gtest]
+fn ids_depend_on_the_process_id() {
+    let hash_keys = std::hash::RandomState::new();
+    let parent: Vec<u64> = (0..1_000)
+        .map(|counter| crate::packets::id_for(&hash_keys, 100, counter))
+        .collect();
+    let child: Vec<u64> = (0..1_000)
+        .map(|counter| crate::packets::id_for(&hash_keys, 101, counter))
+        .collect();
+
+    // No ID of the child, drawn at any counter, repeats one of the parent.
+    let parent_ids: HashSet<u64> = parent.iter().copied().collect();
+    expect_that!(
+        child.iter().filter(|id| parent_ids.contains(id)).count(),
+        eq(0)
+    );
+
+    // The same process and counter always give the same ID, so only the process ID differs.
+    expect_eq!(
+        crate::packets::id_for(&hash_keys, 100, 7),
+        parent.get(7).copied().unwrap_or(0)
+    );
+}
+
 /// The process descriptor names the process after its executable's file name.
 ///
 /// A descriptor with only a process ID shows the process by that ID alone, so the traces of

@@ -10,21 +10,31 @@ use tracing::Metadata;
 /// Returns an ID for a track or a correlation, which is never 0 and never repeats within the
 /// process.
 ///
-/// Each ID is a process-wide counter passed through a bijective mix keyed by a per-process
-/// seed, so IDs differ between processes and need no central registry.
+/// Each ID is a process-wide counter passed through a bijective mix keyed by the process ID, so
+/// IDs differ between processes and need no central registry.
+/// The process ID is read on every call, so a child forked after the parent drew IDs draws
+/// different ones, although it inherits the parent's counter and hash keys.
 /// The IDs do not come from the thread-local random generator, because spans and events are
 /// still recorded during thread teardown, after that generator may be gone.
 pub(crate) fn unique_uuid() -> u64 {
-    static SEED: OnceLock<u64> = OnceLock::new();
+    static HASH_KEYS: OnceLock<RandomState> = OnceLock::new();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     // The standard library's hash keys stay readable during thread teardown.
-    let seed = *SEED.get_or_init(|| RandomState::new().hash_one(std::process::id()));
+    let hash_keys = HASH_KEYS.get_or_init(RandomState::new);
     loop {
-        let id = mix(seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed)));
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = id_for(hash_keys, std::process::id(), counter);
         if id != 0 {
             return id;
         }
     }
+}
+
+/// Returns the ID that the process `pid` draws for `counter` under `hash_keys`.
+///
+/// For one process the IDs of distinct counters are distinct, because the mix is a bijection.
+pub(crate) fn id_for(hash_keys: &RandomState, pid: u32, counter: u64) -> u64 {
+    mix(hash_keys.hash_one(pid).wrapping_add(counter))
 }
 
 /// Returns the finalizer of the [SplitMix64] generator applied to `value`, a bijection on `u64`
