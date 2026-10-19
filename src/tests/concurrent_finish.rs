@@ -1,0 +1,307 @@
+//! Regression tests for finishing a trace while its sampler is mid-sample: from the sampler
+//! thread itself, and from several threads at once.
+
+use crate::process_memory::ProcessMemorySource;
+use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
+use crate::tests::{TestWriter, decode, events_of_type};
+use crate::{FinishHandle, PerfettoLayer, idl};
+use googletest::prelude::*;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak, mpsc};
+use std::time::Duration;
+use tracing_subscriber::fmt::MakeWriter;
+
+/// The bound on waiting for a finish, far above any scheduling delay on a loaded machine.
+///
+/// A finish that deadlocks exceeds it, which fails the test instead of hanging the suite.
+const FINISH_BOUND: Duration = Duration::from_secs(30);
+
+/// The value of the sample written before the sampler pauses.
+const FIRST_SAMPLE: u64 = 1024;
+
+/// The value of the sample read while the trace finishes, which is never written.
+const SECOND_SAMPLE: u64 = 2048;
+
+/// When a [`PausingProcessMemory`] finishes the trace itself, once the test released it.
+enum SourceFinish {
+    /// The source never finishes the trace.
+    Never,
+    /// The source finishes the trace before anything else does.
+    First,
+    /// The source finishes the trace while another thread's finish joins the sampler.
+    DuringAnotherFinish,
+}
+
+/// A memory source that reports [`FIRST_SAMPLE`], then pauses in its second sample until the
+/// test releases it, and finishes the trace from the sampler thread as `source_finish` says.
+///
+/// The sampler writes a sample before it reads the next one, so the pause proves that the first
+/// sample reached the writer.
+struct PausingProcessMemory {
+    samples: AtomicUsize,
+    paused: mpsc::Sender<()>,
+    /// The test's release, behind a mutex because the source must be [`Sync`].
+    release: Mutex<mpsc::Receiver<()>>,
+    source_finish: SourceFinish,
+    /// The handle of the trace that the source samples for, set once the layer is built.
+    finish: Arc<OnceLock<FinishHandle>>,
+    output: TestWriter,
+    /// Sends the length of the output when the source's own finish returned.
+    finished: mpsc::Sender<usize>,
+}
+
+impl PausingProcessMemory {
+    /// Finishes the trace as `source_finish` says, and reports the output written by then.
+    fn finish_trace(&self) {
+        let Some(finish) = self.finish.get() else {
+            return;
+        };
+        match self.source_finish {
+            SourceFinish::Never => return,
+            SourceFinish::First => {}
+            SourceFinish::DuringAnotherFinish => {
+                // Wait until the other finish has taken the sampler thread to join it.
+                // The check takes the lock that the sampler's own finish takes, so a finish that
+                // held it while joining stalls this check as it would stall that finish.
+                while !finish.sampler_join_began() {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        finish.finish();
+        // The receiver is gone only after the test stopped waiting.
+        self.finished.send(self.output.buf.lock().len()).ok();
+    }
+}
+
+impl ProcessMemorySource for PausingProcessMemory {
+    fn resident_set_size_bytes(&self) -> Option<u64> {
+        match self.samples.fetch_add(1, Ordering::Relaxed) {
+            0 => Some(FIRST_SAMPLE),
+            1 => {
+                // The receivers are gone only after the test stopped waiting.
+                self.paused.send(()).ok();
+                self.release.lock().recv().ok();
+                self.finish_trace();
+                Some(SECOND_SAMPLE)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A layer whose sampler samples a [`PausingProcessMemory`], with the handles that drive it.
+struct PausingLayer {
+    layer: PerfettoLayer<TestWriter>,
+    output: TestWriter,
+    paused: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+    /// Receives the length of the output when the source's own finish returned.
+    source_finished: mpsc::Receiver<usize>,
+}
+
+/// Returns a layer that samples a [`PausingProcessMemory`] every millisecond, which finishes the
+/// trace as `source_finish` says.
+fn pausing_layer(source_finish: SourceFinish) -> Result<PausingLayer> {
+    let writer = TestWriter::new();
+    let output = writer.make_writer();
+    let (paused_sender, paused) = mpsc::channel();
+    let (release, release_receiver) = mpsc::channel();
+    let (finished_sender, source_finished) = mpsc::channel();
+    let finish = Arc::new(OnceLock::new());
+    let source = PausingProcessMemory {
+        samples: AtomicUsize::new(0),
+        paused: paused_sender,
+        release: Mutex::new(release_receiver),
+        source_finish,
+        finish: Arc::clone(&finish),
+        output: output.make_writer(),
+        finished: finished_sender,
+    };
+    let layer = PerfettoLayer::new(writer)
+        .with_process_memory_source(MIN_SAMPLING_INTERVAL, Box::new(source));
+    // The source reads the handle only after the test releases it, which is after this.
+    finish.set(layer.finish_handle()).or_fail()?;
+    Ok(PausingLayer {
+        layer,
+        output,
+        paused,
+        release,
+        source_finished,
+    })
+}
+
+/// What a test observed right after a finish on another thread returned.
+struct FinishReturn {
+    /// The length of the output.
+    written: usize,
+    /// The strong references to the layer's writer, one of which a running sampler holds.
+    writer_references: usize,
+}
+
+/// Finishes the trace through `finish` on a new thread, and sends what it observed on return.
+fn finish_on_thread(
+    finish: FinishHandle,
+    layer_writer: Weak<TestWriter>,
+    output: TestWriter,
+    returned: mpsc::Sender<FinishReturn>,
+) {
+    std::thread::spawn(move || {
+        finish.finish();
+        let finish_return = FinishReturn {
+            written: output.buf.lock().len(),
+            writer_references: layer_writer.strong_count(),
+        };
+        returned.send(finish_return).ok();
+    });
+}
+
+/// Returns the values of the counter samples in `trace`.
+fn sample_values(trace: &idl::Trace) -> Vec<i64> {
+    events_of_type(trace, idl::track_event::Type::Counter)
+        .filter_map(|event| match event.counter_value_field {
+            Some(idl::track_event::CounterValueField::CounterValue(value)) => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A finish from the sampler thread while another thread's finish stops the sampler lets both
+/// return, and no sample is written after either returned.
+///
+/// A finish that joined the sampler while holding the lock that the sampler's own finish takes
+/// would deadlock both, as would one that waited for the sampler on the sampler thread itself.
+#[gtest]
+fn finish_from_the_sampler_thread_during_another_finish_returns() -> Result<()> {
+    let pausing = pausing_layer(SourceFinish::DuringAnotherFinish)?;
+    let layer_writer = Arc::clone(pausing.layer.writer());
+
+    // Finish while the sampler is paused in its second sample, which then finishes too.
+    pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
+    let (returned, returns) = mpsc::channel();
+    finish_on_thread(
+        pausing.layer.finish_handle(),
+        Arc::downgrade(&layer_writer),
+        pausing.output.make_writer(),
+        returned,
+    );
+    pausing.release.send(()).or_fail()?;
+
+    let Ok(test_finish) = returns.recv_timeout(FINISH_BOUND) else {
+        // Dropping the layer would finish it too, which waits for the stuck finish.
+        std::mem::forget(pausing.layer);
+        return fail!("the test's finish deadlocked");
+    };
+    let Ok(source_written) = pausing.source_finished.recv_timeout(FINISH_BOUND) else {
+        std::mem::forget(pausing.layer);
+        return fail!("the sampler's own finish deadlocked or panicked");
+    };
+    drop(pausing.layer);
+
+    // The test's finish returned only after the sampler had stopped and released its writer.
+    expect_eq!(test_finish.writer_references, 2);
+    // Nothing reached the writer after either finish returned.
+    let written = pausing.output.buf.lock().len();
+    expect_eq!(test_finish.written, written);
+    expect_eq!(source_written, written);
+    // The sample read while the trace finished is discarded.
+    let trace = decode(&pausing.output)?;
+    let first_sample = i64::try_from(FIRST_SAMPLE).or_fail()?;
+    verify_that!(sample_values(&trace), elements_are![eq(&first_sample)])
+}
+
+/// A finish from the sampler thread returns without waiting for the sampler, the sampler writes
+/// nothing afterwards, and a later finish still waits for the sampler to stop.
+///
+/// A finish that joined the sampler from the sampler thread would join itself, which panics on
+/// Unix and blocks forever on Windows.
+#[gtest]
+fn finish_from_the_sampler_thread_does_not_join_itself() -> Result<()> {
+    let pausing = pausing_layer(SourceFinish::First)?;
+    let layer_writer = Arc::clone(pausing.layer.writer());
+
+    // The source finishes the trace from the sampler thread, then the test finishes it again.
+    pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
+    pausing.release.send(()).or_fail()?;
+    let Ok(source_written) = pausing.source_finished.recv_timeout(FINISH_BOUND) else {
+        // Dropping the layer would finish it too, which waits for the stuck finish.
+        std::mem::forget(pausing.layer);
+        return fail!("the sampler's own finish deadlocked or panicked");
+    };
+    let (returned, returns) = mpsc::channel();
+    finish_on_thread(
+        pausing.layer.finish_handle(),
+        Arc::downgrade(&layer_writer),
+        pausing.output.make_writer(),
+        returned,
+    );
+    let Ok(test_finish) = returns.recv_timeout(FINISH_BOUND) else {
+        std::mem::forget(pausing.layer);
+        return fail!("the finish after the sampler's own finish deadlocked");
+    };
+    drop(pausing.layer);
+
+    // The later finish returned only after the sampler had stopped and released its writer.
+    expect_eq!(test_finish.writer_references, 2);
+    // Nothing reached the writer after the sampler's own finish returned.
+    expect_eq!(pausing.output.buf.lock().len(), source_written);
+    // The sample read while the trace finished is discarded.
+    let trace = decode(&pausing.output)?;
+    let first_sample = i64::try_from(FIRST_SAMPLE).or_fail()?;
+    verify_that!(sample_values(&trace), elements_are![eq(&first_sample)])
+}
+
+/// Two concurrent finishes both return only after the sampler has stopped, including the one that
+/// finds the sampler already being joined by the other.
+///
+/// A finish that returned once another had taken the sampler to join it would return while the
+/// sampler can still write a sample.
+#[gtest]
+fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
+    let pausing = pausing_layer(SourceFinish::Never)?;
+    let layer_writer = Arc::clone(pausing.layer.writer());
+
+    // Finish twice while the sampler is paused in its second sample.
+    pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
+    let (returned, returns) = mpsc::channel();
+    for _ in 0..2 {
+        finish_on_thread(
+            pausing.layer.finish_handle(),
+            Arc::downgrade(&layer_writer),
+            pausing.output.make_writer(),
+            returned.clone(),
+        );
+    }
+
+    // Neither finish returns while the sampler is paused.
+    // The wait gives both finishes time to begin, and passes only by timing out.
+    let mut finish_returns: Vec<FinishReturn> = returns
+        .recv_timeout(Duration::from_millis(200))
+        .into_iter()
+        .collect();
+    expect_that!(
+        finish_returns.len(),
+        eq(0),
+        "a finish returned while the sampler was paused"
+    );
+    pausing.release.send(()).or_fail()?;
+
+    while finish_returns.len() < 2 {
+        let Ok(finish_return) = returns.recv_timeout(FINISH_BOUND) else {
+            // Dropping the layer would finish it too, which waits for the stuck finish.
+            std::mem::forget(pausing.layer);
+            return fail!("a finish did not return after the sampler was released");
+        };
+        finish_returns.push(finish_return);
+    }
+    drop(pausing.layer);
+
+    // Each finish returned after the sampler had released its writer and written its last sample.
+    let written = pausing.output.buf.lock().len();
+    for finish_return in finish_returns {
+        expect_eq!(finish_return.writer_references, 2);
+        expect_eq!(finish_return.written, written);
+    }
+    Ok(())
+}
