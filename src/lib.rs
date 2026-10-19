@@ -102,7 +102,10 @@
 //! [`PerfettoLayer::with_process_memory_rss`] adds a counter track that samples the process's
 //! resident set size.
 //! A [`FinishHandle`] ends the trace while the layer is still installed, for example in a global
-//! dispatcher that is never dropped.
+//! dispatcher, which never drops its layer.
+//! [`FinishHandle::finish`] is the end of the trace: it waits for the writes under way, flushes
+//! the writer, and nothing is written afterwards.
+//! Dropping the layer ends the trace the same way.
 //! [`FinishHandle::finish`] returns the writer's first error, after which the layer wrote nothing
 //! more, so the output stays readable up to the failed write.
 //!
@@ -140,13 +143,10 @@
 //!
 //! # Limitations
 //!
-//! - Finishing stops new writes, but a write already under way can still land after
-//!   [`FinishHandle::finish`] returns, and the writer is not flushed ([#5]).
 //! - With tracing-subscriber 0.3.23, a child span that closes on a thread whose default
 //!   dispatcher is another one leaves its parent's lifetime slice without an end, or panics (see
 //!   [Installing](#installing), [#9]).
 //!
-//! [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 //! [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 //!
 //! # Examples
