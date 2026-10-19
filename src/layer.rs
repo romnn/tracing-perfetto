@@ -318,6 +318,14 @@ where
         if !self.config.span_lifetimes && !self.config.thread_slices {
             return;
         }
+        // A span that the writer creates while the layer calls it keeps no state, as if this
+        // layer did not record it: its descriptor and begin could not be written, so a placed
+        // span would put its events on an undescribed track, or end its parent's slice when it
+        // closes.
+        // Its events then land on the track of its nearest recorded ancestor.
+        if self.sink.gate().is_calling_writer() {
+            return;
+        }
         let Some(span) = ctx.span(id) else {
             return;
         };

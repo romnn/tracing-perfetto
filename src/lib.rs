@@ -108,6 +108,8 @@
 //! Dropping the layer ends the trace the same way.
 //! [`FinishHandle::finish`] returns the writer's first error, after which the layer wrote nothing
 //! more, so the output stays readable up to the failed write.
+//! A writer that panics fails the trace the same way, and the panic propagates to the caller,
+//! unless it panics on the sampler thread, which it ends, or while another panic unwinds.
 //!
 //! # Installing
 //!

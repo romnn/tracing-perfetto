@@ -11,12 +11,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The message of the error that a writer's panic leaves in the gate.
+pub(crate) const WRITER_PANICKED: &str = "the trace's writer panicked";
+
 /// The only path from a layer and its process-memory sampler to the writer.
 ///
 /// The sequence's preamble precedes every other message, because every packet that reads the
 /// sequence clock must follow the clock snapshot that defines it.
 /// After the first failed write the sink writes nothing more, so the output is the trace up to
 /// that write, possibly followed by the part of the failed message that the writer took.
+/// A writer that panics fails the same way, and is not called again, not even to flush it.
 /// Once [closed](CloseSink::close), the sink writes nothing more either.
 pub(crate) struct TraceSink<W> {
     writer: W,
@@ -36,7 +40,7 @@ pub(crate) struct WriteGate {
     /// Whether the gate is closed, which only the holder of the state lock changes.
     ///
     /// Once set, no write reaches the writer, and the thread that set it flushes the writer
-    /// before it releases the lock.
+    /// before it releases the lock, unless it set it because the writer panicked.
     closed: AtomicBool,
     /// The call to the writer that a thread makes while it holds the state lock, while one does.
     ///
@@ -68,7 +72,8 @@ enum GateState {
     Open,
     /// A write or the flush failed, so no more writes reach the writer.
     ///
-    /// It holds the error until a [`FinishHandle`] reports it.
+    /// It holds the error until a [`FinishHandle`] reports it, which is [`WRITER_PANICKED`] for
+    /// a writer that panicked.
     /// A gate fails only once, so a later failure of the flush is neither kept nor reported,
     /// also after the first error was reported.
     ///
@@ -91,6 +96,27 @@ impl WriteGate {
     /// Returns whether the gate is closed, after which no write reaches the writer.
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Returns whether the calling thread is inside a call to the writer, holding the state lock.
+    ///
+    /// Nothing that the thread records there is written, see [`TraceSink::write`].
+    pub(crate) fn is_calling_writer(&self) -> bool {
+        self.writer_call
+            .lock()
+            .as_ref()
+            .is_some_and(|call| call.thread == thread_id::get())
+    }
+
+    /// Fails the gate for a writer that panicked, unless it failed before, and closes it
+    /// without flushing, so the writer is never called again.
+    ///
+    /// The caller holds the state lock.
+    fn fail_for_writer_panic(&self, state: &mut GateState) {
+        self.closed.store(true, Ordering::Release);
+        if !matches!(state, GateState::Failed(_)) {
+            *state = GateState::Failed(Some(std::io::Error::other(WRITER_PANICKED)));
+        }
     }
 
     /// Asks the call to the writer that the calling thread is inside, if it is inside one, to
@@ -132,20 +158,46 @@ pub(crate) fn lock_counting_contention<'mutex, T>(
     })
 }
 
-/// Marks the calling thread as the one calling the writer, until it is dropped.
+/// Holds the state lock for calls to the writer, and marks the calling thread as the one
+/// calling the writer, until it is dropped.
 ///
-/// It must be created while the state lock is held and dropped before the lock is released.
+/// Dropping it clears the mark before it releases the lock.
+/// Dropped without [`Self::returned`], because the writer panicked and the panic unwinds
+/// through the sink, it fails the gate with [`WRITER_PANICKED`] and closes it, without
+/// flushing, so the writer is never called again.
+/// A writer that panicked may be broken for good: tracing-subscriber's writer for a
+/// `std::sync::Mutex` panics on every call once the panic poisoned the mutex.
+/// The panic itself keeps unwinding to the code that recorded the span or event.
 struct CallingWriter<'gate> {
     gate: &'gate WriteGate,
+    state: parking_lot::MutexGuard<'gate, GateState>,
+    /// Whether the calls to the writer returned instead of unwinding.
+    ///
+    /// Every exit from the calls to the writer that does not unwind must set it through
+    /// [`Self::returned`], or the gate fails as if the writer panicked.
+    /// It is set on return instead of read from [`std::thread::panicking`], which is also `true`
+    /// for a write that returns while another panic unwinds, such as the end of a span whose
+    /// guard that unwinding drops.
+    returned: bool,
 }
 
 impl<'gate> CallingWriter<'gate> {
-    fn enter(gate: &'gate WriteGate) -> Self {
+    /// Marks the calling thread, which holds `state`, as the one calling the writer.
+    fn enter(gate: &'gate WriteGate, state: parking_lot::MutexGuard<'gate, GateState>) -> Self {
         *gate.writer_call.lock() = Some(WriterCall {
             thread: thread_id::get(),
             close_requested: false,
         });
-        Self { gate }
+        Self {
+            gate,
+            state,
+            returned: false,
+        }
+    }
+
+    /// Ends the calls to the writer, which returned, and releases the state lock.
+    fn returned(mut self) {
+        self.returned = true;
     }
 
     /// Returns whether a finish from inside this call asked to close the gate.
@@ -161,6 +213,12 @@ impl<'gate> CallingWriter<'gate> {
 impl Drop for CallingWriter<'_> {
     fn drop(&mut self) {
         *self.gate.writer_call.lock() = None;
+        if self.returned {
+            return;
+        }
+
+        // The writer panicked
+        self.gate.fail_for_writer_panic(&mut self.state);
     }
 }
 
@@ -200,19 +258,27 @@ impl<W: PerfettoWriter> TraceSink<W> {
     /// later write return `false`, and the gate keeps the error.
     /// A closed gate writes nothing and returns `false`.
     /// A finish from inside the writer closes the gate when this write returns.
+    /// A writer that panics fails and closes the gate, and the panic propagates to the caller,
+    /// unless another panic unwinds already, as [`call_writer`] says.
+    /// A write from inside a call to the writer, on the thread that calls it, writes nothing and
+    /// returns `false`.
     pub(crate) fn write(&self, trace: &idl::Trace) -> bool {
+        // A span or event that the writer records, also through a panic hook that records the
+        // writer's panic, would wait for the state lock that its own thread holds.
+        if self.gate.is_calling_writer() {
+            return false;
+        }
         let Some(message) = encode(trace) else {
             return false;
         };
 
-        let mut state = self.gate.state.lock();
-        let calling_writer = CallingWriter::enter(&self.gate);
-        let written = self.write_locked(&mut state, message);
+        let mut calling_writer = CallingWriter::enter(&self.gate, self.gate.state.lock());
+        let written = self.write_locked(&mut calling_writer.state, message);
         // A finish from inside the writer could not take the lock that this write holds.
         if calling_writer.close_requested() {
-            self.close_locked(&mut state);
+            self.close_locked(&mut calling_writer.state);
         }
-        drop(calling_writer);
+        calling_writer.returned();
         written
     }
 
@@ -240,11 +306,15 @@ impl<W: PerfettoWriter> TraceSink<W> {
 
     /// Hands `message` to the writer, and fails the gate if the write fails.
     fn write_message(&self, state: &mut GateState, message: BytesMut) -> bool {
-        match self.writer.write_log(message) {
-            Ok(()) => true,
-            Err(err) => {
+        match call_writer(|| self.writer.write_log(message)) {
+            Some(Ok(())) => true,
+            Some(Err(err)) => {
                 // Only the first failure gets here, since the gate stays failed after it.
                 *state = GateState::Failed(Some(err));
+                false
+            }
+            None => {
+                self.gate.fail_for_writer_panic(state);
                 false
             }
         }
@@ -261,10 +331,14 @@ impl<W: PerfettoWriter> TraceSink<W> {
         if self.gate.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Err(err) = self.writer.flush()
-            && !matches!(state, GateState::Failed(_))
-        {
-            *state = GateState::Failed(Some(err));
+        match call_writer(|| self.writer.flush()) {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                if !matches!(state, GateState::Failed(_)) {
+                    *state = GateState::Failed(Some(err));
+                }
+            }
+            None => self.gate.fail_for_writer_panic(state),
         }
     }
 }
@@ -277,6 +351,7 @@ pub(crate) trait CloseSink: Send + Sync {
     /// Waits for the write in progress, which holds the state lock, so every write that took the
     /// lock before has reached the writer when this returns.
     /// A flush error is kept like a write error, unless a write failed before.
+    /// A flush that panics fails the gate too, and the panic propagates to the caller.
     /// Closing again has no further effect.
     /// The calling thread must not be inside a call to the writer, since this waits for the lock
     /// that such a call holds.
@@ -286,11 +361,34 @@ pub(crate) trait CloseSink: Send + Sync {
 impl<W: PerfettoWriter + Send + Sync> CloseSink for TraceSink<W> {
     fn close(&self) {
         #[cfg(test)]
-        let mut state = lock_counting_contention(&self.gate.state, &self.gate.close_contentions);
+        let state = lock_counting_contention(&self.gate.state, &self.gate.close_contentions);
         #[cfg(not(test))]
-        let mut state = self.gate.state.lock();
-        let _calling_writer = CallingWriter::enter(&self.gate);
-        self.close_locked(&mut state);
+        let state = self.gate.state.lock();
+        let mut calling_writer = CallingWriter::enter(&self.gate, state);
+        self.close_locked(&mut calling_writer.state);
+        calling_writer.returned();
+    }
+}
+
+/// Calls the writer through `call`, and returns `None` if the writer panicked while another
+/// panic unwinds.
+///
+/// A panic that left the writer then would escape a destructor during cleanup, such as a span
+/// guard's or the layer's, which aborts the process, so it is caught, and its payload leaked,
+/// since dropping the payload could panic again.
+/// The caller fails the gate, so the writer that the caught panic may have broken is never
+/// called again, which is why the call needs no unwind safety.
+/// Outside an unwind, the writer's panic propagates, and [`CallingWriter`] fails the gate.
+fn call_writer<T>(call: impl FnOnce() -> T) -> Option<T> {
+    if !std::thread::panicking() {
+        return Some(call());
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(returned) => Some(returned),
+        Err(payload) => {
+            std::mem::forget(payload);
+            None
+        }
     }
 }
 

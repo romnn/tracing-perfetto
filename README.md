@@ -147,14 +147,24 @@ Dropping the layer ends the trace the same way, but a global dispatcher never dr
 call `finish()` before the process exits.
 After the first failed write the layer writes nothing more, so the file stays readable up to that
 write, and `finish()` returns the error, or else an error of the flush.
+A writer that panics fails the trace the same way: the panic reaches the code that recorded the
+span or event, the layer never calls the writer again, not even to flush it, and `finish()`
+returns an error that says that the writer panicked.
+A panic on the process-memory sampler thread ends the sampler instead, and a panic while another
+panic unwinds is caught, since a second panic there aborts the process.
 
 - `tracing_appender::non_blocking` drops messages when its queue is full unless it is built with
   `lossy(false)`, and a dropped message can leave the rest of the trace unreadable.
   Its flush does not wait for the queue, so drop its `WorkerGuard` after `finish()`: dropping the
   guard flushes the queue, but it waits about a second at most, so a large backlog can still lose
   its tail.
-- The writer must not record spans or events: the layer calls it while holding the lock that
-  every write of the trace takes, so a span or event that the writer records deadlocks.
+- Spans and events that the writer records while the layer calls it, such as through a panic
+  hook that records the writer's panic, are not written: the layer calls the writer while
+  holding the lock that every write of the trace takes, which their writes cannot wait for.
+  This holds only for the writer's own layer, so a writer must not record into another
+  tracing-perfetto layer, whose writer may wait for this one in the same way.
+  Nor may a writer enter, exit or drop spans that the application created, since their begin or
+  end would be dropped and their slices would not balance.
 - The writer may call `finish()` from inside its own write, on the thread that the layer calls
   it on, which returns at once and ends the trace when that write returns, but it must not wait
   for a `finish()` on another thread, including one that it spawns and joins, which waits for the
