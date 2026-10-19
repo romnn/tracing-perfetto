@@ -54,9 +54,9 @@ impl TraceLifecycle {
     /// stopped.
     /// On the sampler thread, which cannot wait for itself, this does not wait for the sampler,
     /// which writes no further sample.
-    /// Inside a call to the writer, on any thread, this neither waits for the sampler, which may
-    /// wait for that call, nor for the sink, whose lock that call holds: it requests both to
-    /// stop, and the sink closes and flushes when that call returns.
+    /// Inside a call to the writer, on the thread that the layer calls it on, this neither waits
+    /// for the sampler, which may wait for that call, nor for the sink, whose lock that call
+    /// holds: it requests both to stop, and the sink closes and flushes when that call returns.
     ///
     /// Returns whether the trace has ended, which it has unless this was called inside a call to
     /// the writer.
@@ -145,10 +145,16 @@ impl FinishHandle {
     ///
     /// Called from the sampler thread, by a [`ProcessMemorySource`], it ends the trace without
     /// waiting for the sampler, which then writes no further sample.
-    /// Called from inside the writer, on any thread, it returns at once, because it cannot wait
-    /// for the write that called it: it asks the sampler to stop, and the trace ends and the
-    /// writer is flushed when that write returns.
+    /// Called from inside the writer, on the thread that the layer calls the writer on, it
+    /// returns at once, because it cannot wait for the write that called it: it asks the sampler
+    /// to stop, and the trace ends and the writer is flushed when that write returns.
     /// A later finish waits for the sampler and reports an error of that write or flush.
+    /// Any other thread waits for the write in progress, so a finish on a thread that the writer
+    /// waits for, such as one it spawns and joins inside a write, deadlocks.
+    ///
+    /// The caller must not hold anything that the writer or the process-memory source needs,
+    /// such as the `Mutex` of a `Mutex<W>` writer, because this waits for the write in progress
+    /// and for the sample being read, and then flushes the writer on the calling thread.
     ///
     /// Dropping the layer ends the trace and flushes the writer too, but only this reports an
     /// error.

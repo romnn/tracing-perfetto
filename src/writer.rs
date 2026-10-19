@@ -33,9 +33,10 @@ use tracing_subscriber::fmt::MakeWriter;
 ///
 /// A sink must not record spans or events: the layer calls it while holding the lock that every
 /// write of the trace takes, so a span or event that the sink records deadlocks on that lock.
-/// A sink may finish the trace from inside a write or flush, on any thread: that finish returns
-/// at once, and the trace ends when the write returns.
-/// A sink must not wait for a finish on another thread, which waits for the write in progress.
+/// A sink may finish the trace from inside a write or flush, on the thread that the layer calls
+/// it on: that finish returns at once, and the trace ends when the write returns.
+/// A sink must not wait for a finish on another thread, including one that it spawns and joins,
+/// which waits for the write in progress.
 pub trait PerfettoWriter {
     /// Writes one encoded perfetto `Trace` message.
     ///

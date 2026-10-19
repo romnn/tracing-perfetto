@@ -155,9 +155,13 @@ write, and `finish()` returns the error, or else an error of the flush.
   its tail.
 - The writer must not record spans or events: the layer calls it while holding the lock that
   every write of the trace takes, so a span or event that the writer records deadlocks.
-- The writer may call `finish()` from inside its own write, which returns at once and ends the
-  trace when that write returns, but it must not wait for a `finish()` on another thread, which
-  waits for the write in progress.
+- The writer may call `finish()` from inside its own write, on the thread that the layer calls
+  it on, which returns at once and ends the trace when that write returns, but it must not wait
+  for a `finish()` on another thread, including one that it spawns and joins, which waits for the
+  write in progress.
+- Do not call `finish()` while holding the writer's lock, such as the `Mutex` of a
+  `Mutex<BufWriter<File>>`, or anything else the writer or the process-memory source needs,
+  because `finish()` waits for the write in progress and then flushes the writer itself.
 
 ## Known limitations
 
