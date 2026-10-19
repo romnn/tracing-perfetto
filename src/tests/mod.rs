@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing_subscriber::fmt::MakeWriter;
 
 mod concurrent_finish;
+mod cross_dispatcher;
 mod entered_stack;
 mod layer;
 mod thread_slices;

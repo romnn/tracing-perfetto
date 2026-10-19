@@ -106,13 +106,45 @@
 //! [`FinishHandle::finish`] returns the writer's first error, after which the layer wrote nothing
 //! more, so the output stays readable up to the failed write.
 //!
+//! # Installing
+//!
+//! Install the subscriber that holds the layer as the global default, with
+//! [`SubscriberInitExt::init`] or [`tracing::subscriber::set_global_default`], so that spans close
+//! under it on every thread that sets no default of its own.
+//!
+//! A scoped default from [`tracing::subscriber::with_default`] or
+//! [`tracing::subscriber::set_default`] applies only on the thread that sets it.
+//! tracing-subscriber 0.3.23 releases a closing span's hold on its parent through the default of
+//! the thread it closes on, not through the span's own dispatcher ([tokio-rs/tracing#2870]), so
+//! a span that closes under another default breaks its parent's slice ([#9]):
+//!
+//! - With no default there, the parent and its ancestors never close.
+//!   Their lifetime slices have no end, and the parent's later siblings move to sub-tracks.
+//! - With another registry there, the close panics, or closes that registry's span of the
+//!   parent's ID.
+//!
+//! Under a scoped default, drop spans only where their dispatcher is the default.
+//! [`WithSubscriber::with_subscriber`] sets the default only while it polls the future, not while
+//! the future is dropped.
+//! A span that the future still holds then, such as the span that [`Instrument::instrument`]
+//! attaches, closes outside the default even after the future completes, and a cancelled future
+//! closes all of its spans there.
+//! For futures that run on other threads, use the global default, or a wrapper or executor that
+//! sets the default both while it polls a future and while it drops it.
+//! Set the default as well on threads that drop spans handed to them.
+//!
+//! [`SubscriberInitExt::init`]: tracing_subscriber::util::SubscriberInitExt::init
+//! [`WithSubscriber::with_subscriber`]: tracing::instrument::WithSubscriber::with_subscriber
+//! [`Instrument::instrument`]: tracing::instrument::Instrument::instrument
+//! [tokio-rs/tracing#2870]: https://github.com/tokio-rs/tracing/issues/2870
+//!
 //! # Limitations
 //!
 //! - Finishing stops new writes, but a write already under way can still land after
 //!   [`FinishHandle::finish`] returns, and the writer is not flushed ([#5]).
-//! - Spans must close under the dispatcher the layer is installed in: when a child span closes
-//!   on a thread whose default dispatcher is another one, its parent's lifetime slice never ends
-//!   ([#9]).
+//! - With tracing-subscriber 0.3.23, a child span that closes on a thread whose default
+//!   dispatcher is another one leaves its parent's lifetime slice without an end, or panics (see
+//!   [Installing](#installing), [#9]).
 //!
 //! [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 //! [#9]: https://github.com/romnn/tracing-perfetto/issues/9
