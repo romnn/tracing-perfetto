@@ -215,7 +215,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             .unwrap_or(false);
         if !described {
             trace_packets.push(packets::track_descriptor_packet(
-                thread_track::current_thread_track_descriptor(),
+                thread_track::current_thread_track_descriptor(self.sequence.process_track_uuid()),
             ));
         }
         let timestamp = self.sink.sequence().now();

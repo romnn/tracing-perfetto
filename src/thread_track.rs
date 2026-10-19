@@ -1,12 +1,29 @@
-//! The calling thread's track: its UUID and its descriptor with the kernel's thread ID.
+//! The calling thread's track: its UUID, and its descriptor with the kernel's thread ID if known.
 
 use crate::{idl, packets};
 
 thread_local! {
     /// The UUID of the calling thread's track, shared by every layer in the process.
     static THREAD_TRACK_UUID: u64 = packets::unique_uuid();
-    /// The kernel's ID for the calling thread, read once per thread.
-    static OS_THREAD_ID: i32 = os_thread_id();
+    /// The kernel's ID for the calling thread as a trace thread ID, read once per thread.
+    static TRACE_THREAD_ID: Option<i32> = trace_thread_id(kernel_thread_id());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The source of the kernel thread ID that the calling thread reports.
+    static KERNEL_THREAD_ID_SOURCE: std::cell::Cell<KernelThreadIdSource> =
+        const { std::cell::Cell::new(KernelThreadIdSource::Platform) };
+}
+
+/// The source of a thread's kernel thread ID in tests.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum KernelThreadIdSource {
+    /// The platform's ID for the thread.
+    Platform,
+    /// A given ID, or `None` for an unknown one, in place of the platform's.
+    Override(Option<u64>),
 }
 
 /// Returns the UUID of the calling thread's track.
@@ -15,43 +32,67 @@ pub(crate) fn current_thread_uuid() -> u64 {
 }
 
 /// Returns the descriptor of the calling thread's track, named after the thread.
-pub(crate) fn current_thread_track_descriptor() -> idl::TrackDescriptor {
-    let thread = idl::ThreadDescriptor {
-        pid: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
-        tid: Some(OS_THREAD_ID.with(|tid| *tid)),
-        thread_name: std::thread::current().name().map(ToString::to_string),
-        ..Default::default()
-    };
+///
+/// Where the kernel's thread ID is known, the track is the thread track of that ID.
+/// Otherwise it is a track below the process track `process_track_uuid`: a thread descriptor
+/// identifies its thread by the process and thread IDs alone, so a made-up ID would claim
+/// another thread, and trace processor would merge the tracks of every thread sharing it.
+pub(crate) fn current_thread_track_descriptor(process_track_uuid: u64) -> idl::TrackDescriptor {
+    let thread_name = std::thread::current().name().map(ToString::to_string);
+    let pid = i32::try_from(std::process::id()).ok();
+    let thread = pid
+        .zip(current_trace_thread_id())
+        .map(|(pid, tid)| idl::ThreadDescriptor {
+            pid: Some(pid),
+            tid: Some(tid),
+            thread_name: thread_name.clone(),
+            ..Default::default()
+        });
     idl::TrackDescriptor {
         uuid: Some(current_thread_uuid()),
-        static_or_dynamic_name: std::thread::current().name().map(packets::track_name),
-        thread: Some(thread),
+        static_or_dynamic_name: thread_name.as_deref().map(packets::track_name),
+        // A thread track belongs to its process through its thread descriptor.
+        parent_uuid: thread.is_none().then_some(process_track_uuid),
+        thread,
         ..Default::default()
     }
 }
 
-/// Returns the kernel's ID for the calling thread, as the trace's thread descriptors expect.
-///
-/// On Linux, [`thread_id::get`] returns the `pthread_t` address rather than the kernel thread
-/// ID, so the ID comes from procfs and falls back to [`thread_id::get`] only when procfs is
-/// unavailable.
-#[cfg(target_os = "linux")]
-fn os_thread_id() -> i32 {
-    procfs_thread_id().unwrap_or_else(fallback_thread_id)
+/// Makes the calling thread report `kernel_thread_id` in place of the kernel's ID for it.
+#[cfg(test)]
+pub(crate) fn override_kernel_thread_id(kernel_thread_id: Option<u64>) {
+    KERNEL_THREAD_ID_SOURCE.with(|source| {
+        source.set(KernelThreadIdSource::Override(kernel_thread_id));
+    });
 }
 
-/// Returns the kernel's ID for the calling thread, as the trace's thread descriptors expect.
-#[cfg(not(target_os = "linux"))]
-fn os_thread_id() -> i32 {
-    fallback_thread_id()
+/// Returns the trace thread ID of the calling thread, if the kernel's ID for it is known.
+fn current_trace_thread_id() -> Option<i32> {
+    #[cfg(test)]
+    if let KernelThreadIdSource::Override(kernel_thread_id) =
+        KERNEL_THREAD_ID_SOURCE.with(std::cell::Cell::get)
+    {
+        return trace_thread_id(kernel_thread_id);
+    }
+    TRACE_THREAD_ID.with(|tid| *tid)
+}
+
+/// Converts the kernel's thread ID to the trace's 32-bit thread ID.
+///
+/// An ID that does not fit is dropped rather than clamped, since clamping gives every such
+/// thread the same ID.
+fn trace_thread_id(kernel_thread_id: Option<u64>) -> Option<i32> {
+    kernel_thread_id.and_then(|id| i32::try_from(id).ok())
 }
 
 /// Reads the calling thread's ID from the `<pid>/task/<tid>` target of `/proc/thread-self`.
 ///
+/// The `thread-id` crate returns the `pthread_t` address on Linux rather than the kernel
+/// thread ID, and the `gettid` syscall needs unsafe code, so the ID is unknown without procfs.
 /// A procfs from another PID namespace names other IDs, so a link whose PID is not this
 /// process's is rejected.
 #[cfg(target_os = "linux")]
-fn procfs_thread_id() -> Option<i32> {
+fn kernel_thread_id() -> Option<u64> {
     let target = std::fs::read_link("/proc/thread-self").ok()?;
     let mut components = target.to_str()?.split('/');
     let pid = components.next()?.parse::<u32>().ok()?;
@@ -62,6 +103,13 @@ fn procfs_thread_id() -> Option<i32> {
 }
 
 /// Returns [`thread_id::get`], which is the kernel thread ID on macOS and Windows.
-fn fallback_thread_id() -> i32 {
-    i32::try_from(thread_id::get()).unwrap_or(i32::MAX)
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn kernel_thread_id() -> Option<u64> {
+    u64::try_from(thread_id::get()).ok()
+}
+
+/// Returns `None`, since the kernel thread ID has no known source on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn kernel_thread_id() -> Option<u64> {
+    None
 }
