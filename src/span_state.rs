@@ -35,7 +35,7 @@ pub(crate) struct SpanState {
     pub(crate) slice_name: Cow<'static, str>,
     /// The ID that links the span's entered slices to each other and to its lifetime slice.
     ///
-    /// It is random and the span's own, so it never links a span to a parent whose track it
+    /// It is unique to the span, so it never links a span to a parent whose track it
     /// shares.
     pub(crate) correlation_id: u64,
     /// The slices that carry the span's fields.

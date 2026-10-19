@@ -2,14 +2,39 @@
 
 use crate::idl;
 use std::borrow::Cow;
+use std::hash::{BuildHasher as _, RandomState};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::Metadata;
 
-/// Returns a random ID for a track or a correlation, which is never 0.
+/// Returns an ID for a track or a correlation, which is never 0 and never repeats within the
+/// process.
 ///
-/// IDs drawn from the full `u64` range do not collide in practice, so tracks and correlations
-/// need no central registry.
+/// Each ID is a process-wide counter passed through a bijective mix keyed by a per-process
+/// seed, so IDs differ between processes and need no central registry.
+/// The IDs do not come from the thread-local random generator, because spans and events are
+/// still recorded during thread teardown, after that generator may be gone.
 pub(crate) fn unique_uuid() -> u64 {
-    rand::random_range(1..=u64::MAX)
+    static SEED: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // The standard library's hash keys stay readable during thread teardown.
+    let seed = *SEED.get_or_init(|| RandomState::new().hash_one(std::process::id()));
+    loop {
+        let id = mix(seed.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed)));
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+/// Returns the finalizer of the [SplitMix64] generator applied to `value`, a bijection on `u64`
+/// that scatters consecutive inputs across the whole range.
+///
+/// [SplitMix64]: https://prng.di.unimi.it/splitmix64.c
+fn mix(value: u64) -> u64 {
+    let value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 /// Returns `name` as the static-or-dynamic name of a track descriptor.

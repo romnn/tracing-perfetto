@@ -27,7 +27,7 @@ pub(crate) struct TraceSequence {
 }
 
 impl TraceSequence {
-    /// Starts a sequence with a random sequence ID and a random process track UUID.
+    /// Starts a sequence with a random sequence ID and a unique process track UUID.
     ///
     /// Sequence ID 0 is invalid and the tracing service reserves 1 for its own packets, so the
     /// random ID starts at 2.

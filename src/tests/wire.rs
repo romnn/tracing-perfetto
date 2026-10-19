@@ -272,6 +272,39 @@ fn thread_descriptors_carry_the_os_thread_id_of_each_thread() -> Result<()> {
     Ok(())
 }
 
+/// Track and correlation IDs are never 0 and never repeat, also when drawn from many threads.
+///
+/// Track UUID 0 is invalid, and two spans sharing an ID would share a track or link each
+/// other's slices.
+#[gtest]
+fn unique_ids_are_nonzero_and_never_repeat() -> Result<()> {
+    const THREADS: usize = 4;
+    const IDS_PER_THREAD: usize = 10_000;
+    let drawn = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                scope.spawn(|| {
+                    (0..IDS_PER_THREAD)
+                        .map(|_| crate::packets::unique_uuid())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(std::thread::ScopedJoinHandle::join)
+            .collect::<std::thread::Result<Vec<_>>>()
+    })
+    .or_fail()?;
+    let ids: Vec<u64> = drawn.into_iter().flatten().collect();
+    expect_that!(ids, each(gt(&0)));
+    expect_eq!(
+        ids.iter().collect::<HashSet<_>>().len(),
+        THREADS * IDS_PER_THREAD
+    );
+    Ok(())
+}
+
 /// The process descriptor names the process after its executable's file name.
 ///
 /// A descriptor with only a process ID shows the process by that ID alone, so the traces of
