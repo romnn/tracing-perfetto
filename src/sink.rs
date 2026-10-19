@@ -58,8 +58,11 @@ pub(crate) struct WriteGate {
 struct WriterCall {
     /// The [`thread_id::get`] of the calling thread.
     ///
-    /// [`thread_id::get`] reads no thread-local value, so it works while a thread's thread-local
-    /// values are destroyed, when the layer still writes, and [`std::thread::current`] panics.
+    /// [`thread_id::get`] reads no thread-local value, so it works in every destructor that runs
+    /// at thread exit, where the layer still writes.
+    /// That includes a destructor that runs after the standard library has destroyed the thread's
+    /// handle, which it does once the `thread_local!` destructors have run, and where
+    /// [`std::thread::current`] panics.
     thread: usize,
     /// Whether a finish from inside the call asked to close the gate once the call returns.
     close_requested: bool,
