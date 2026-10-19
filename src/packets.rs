@@ -29,6 +29,7 @@ pub(crate) fn track_descriptor_packet(descriptor: idl::TrackDescriptor) -> idl::
 pub(crate) fn process_descriptor_packet(process_track_uuid: u64) -> idl::TracePacket {
     let process = idl::ProcessDescriptor {
         pid: Some(i32::try_from(std::process::id()).unwrap_or(i32::MAX)),
+        process_name: process_name(),
         ..Default::default()
     };
     track_descriptor_packet(idl::TrackDescriptor {
@@ -36,6 +37,15 @@ pub(crate) fn process_descriptor_packet(process_track_uuid: u64) -> idl::TracePa
         process: Some(process),
         ..Default::default()
     })
+}
+
+/// Returns the file name of the running executable, which names the process in the trace.
+///
+/// Returns `None` if the executable's path is unavailable, in which case the trace names the
+/// process only by its ID.
+fn process_name() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    Some(executable.file_name()?.to_string_lossy().into_owned())
 }
 
 /// A track event that is not yet on a track.

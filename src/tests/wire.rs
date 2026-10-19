@@ -272,6 +272,39 @@ fn thread_descriptors_carry_the_os_thread_id_of_each_thread() -> Result<()> {
     Ok(())
 }
 
+/// The process descriptor names the process after its executable's file name.
+///
+/// A descriptor with only a process ID shows the process by that ID alone, so the traces of
+/// several programs cannot be told apart.
+#[gtest]
+fn process_descriptor_names_the_executable() -> Result<()> {
+    let writer = TestWriter::new();
+    let extra_writer = writer.make_writer();
+    let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
+    tracing::subscriber::with_default(subscriber, || tracing::info!("opens the trace"));
+
+    let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+    let process_names: Vec<_> = trace
+        .packet
+        .iter()
+        .filter_map(|packet| match &packet.data {
+            Some(idl::trace_packet::Data::TrackDescriptor(descriptor)) => {
+                descriptor.process.as_ref()
+            }
+            _ => None,
+        })
+        .map(|process| process.process_name.clone())
+        .collect();
+    let executable = std::env::current_exe().or_fail()?;
+    let executable_name = executable
+        .file_name()
+        .or_fail()?
+        .to_string_lossy()
+        .into_owned();
+    expect_eq!(process_names, [Some(executable_name)]);
+    Ok(())
+}
+
 /// Spans, unscoped events and memory samples of one layer all share one valid sequence ID.
 ///
 /// A random `u64` clamped to `u32` is `u32::MAX` for all but a 2^-32 share of layers, so
