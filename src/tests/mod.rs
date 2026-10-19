@@ -14,6 +14,7 @@ mod entered_stack;
 mod layer;
 mod thread_slices;
 mod tracks;
+mod user_formatting;
 mod wire;
 mod write_errors;
 

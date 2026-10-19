@@ -365,13 +365,27 @@ where
             return;
         };
 
+        let recorded = span
+            .extensions()
+            .get::<SpanStates>()
+            .is_some_and(|states| states.get(self.layer_id).is_some());
+        if !recorded {
+            return;
+        }
+
+        // The values are formatted while no extensions lock is held, because formatting runs user
+        // code.
+        // A `Debug` impl that records into this span would otherwise take the span's lock again
+        // and deadlock, and one that panics would poison the lock for every later access.
+        //
         // Routing and naming are fixed at creation, so a late `perfetto.track_name` or
         // `perfetto.slice_name` is only an annotation.
+        let mut debug_annotations = DebugAnnotations::default();
+        values.record(&mut debug_annotations);
+
         if let Some(states) = span.extensions_mut().get_mut::<SpanStates>()
             && let Some(span_state) = states.get_mut(self.layer_id)
         {
-            let mut debug_annotations = DebugAnnotations::default();
-            values.record(&mut debug_annotations);
             span_state
                 .recorded_annotations
                 .append(&mut debug_annotations.annotations);
