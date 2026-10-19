@@ -14,8 +14,10 @@ pub(crate) struct TraceLifecycle {
     /// Held by a finish while it joins the sampler, so that a concurrent finish returns only
     /// after the sampler has stopped.
     ///
-    /// A replacement holds it from the stop of the replaced sampler until its own sampler is in
-    /// place, so that a concurrent finish waits for that sampler too.
+    /// A replacement holds it while it joins the replaced sampler, for the same reason.
+    /// It holds it on until its own sampler is in place, which the slot's `finished` flag does
+    /// not need but which lets a concurrent finish simply run before or after the whole
+    /// replacement.
     ///
     /// The sampler thread never takes it, and the join happens outside the
     /// `process_memory_sampler` lock, which the sampler thread takes when it finishes the trace.
@@ -148,16 +150,15 @@ impl TraceLifecycle {
     /// The caller must not be the sampler thread, which cannot join itself, nor be inside a call
     /// to the writer, which the sampler may wait for.
     pub(crate) fn replace_sampler(&self, spawn: impl FnOnce() -> ProcessMemorySampler) {
-        let sampler_join = self.sampler_join.lock();
-        let exit = self.join_sampler();
-        {
-            let mut slot = self.process_memory_sampler.lock();
-            if !slot.finished {
-                slot.sampler = Some(spawn());
-            }
+        // Declared before the join lock, so that a panic payload of the replaced sampler drops
+        // only after the lock is released, also when spawning unwinds.
+        let _replaced_exit;
+        let _sampler_join = self.sampler_join.lock();
+        _replaced_exit = self.join_sampler();
+        let mut slot = self.process_memory_sampler.lock();
+        if !slot.finished {
+            slot.sampler = Some(spawn());
         }
-        drop(sampler_join);
-        drop(exit);
     }
 }
 

@@ -41,7 +41,9 @@ pub(crate) struct ProcessMemorySamplerConfig<W> {
     pub(crate) counter_track: Arc<CounterTrack>,
     /// The interval between samples, raised to at least [`MIN_SAMPLING_INTERVAL`].
     pub(crate) interval: Duration,
-    pub(crate) source: Box<dyn ProcessMemorySource>,
+    /// The source, which the installing layer shares until it has released the lifecycle's
+    /// locks, so that its last reference never drops under them.
+    pub(crate) source: Arc<dyn ProcessMemorySource>,
 }
 
 /// A running sampler thread, which writes until [`Self::request_stop`] stops it.
@@ -74,27 +76,25 @@ impl ProcessMemorySampler {
         let (stop, stopped) = mpsc::channel::<()>();
         let interval = sampling_interval(config.interval);
 
-        let join_handle = std::thread::Builder::new()
-            .name("perfetto-process-memory".to_string())
-            .spawn(move || {
-                loop {
-                    let rss_bytes = config.source.resident_set_size_bytes();
-                    // A stop requested while the source was read, possibly by the source
-                    // finishing the trace itself, discards the sample, which could otherwise
-                    // land after that finish returned.
-                    if stop_requested(&stopped) {
-                        break;
-                    }
-                    if let Some(rss_bytes) = rss_bytes {
-                        write_sample(&config, rss_bytes);
-                    }
-                    match stopped.recv_timeout(interval) {
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    }
+        let join_handle = spawn_thread(move || {
+            loop {
+                let rss_bytes = config.source.resident_set_size_bytes();
+                // A stop requested while the source was read, possibly by the source
+                // finishing the trace itself, discards the sample, which could otherwise
+                // land after that finish returned.
+                if stop_requested(&stopped) {
+                    break;
                 }
-            })
-            .ok();
+                if let Some(rss_bytes) = rss_bytes {
+                    write_sample(&config, rss_bytes);
+                }
+                match stopped.recv_timeout(interval) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .ok();
         let thread_id = join_handle.as_ref().map(|handle| handle.thread().id());
 
         Self {
@@ -149,6 +149,47 @@ impl StoppingSampler {
     /// finish the trace, so the caller drops it only after releasing the layer's locks.
     pub(crate) fn join(self) -> std::thread::Result<()> {
         self.0.join()
+    }
+}
+
+/// Spawns `thread` as a sampler thread.
+///
+/// When the thread cannot be spawned, `thread` is dropped on the calling thread.
+fn spawn_thread(thread: impl FnOnce() + Send + 'static) -> std::io::Result<JoinHandle<()>> {
+    #[cfg(test)]
+    if FAILING_SPAWNS.with(std::cell::Cell::get) {
+        // The standard library drops the thread's closure on the calling thread, too, when the
+        // system refuses a thread.
+        drop(thread);
+        return Err(std::io::Error::other("injected sampler spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name("perfetto-process-memory".to_string())
+        .spawn(thread)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether spawning a sampler thread from the calling thread fails.
+    static FAILING_SPAWNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes spawning a sampler thread from the calling thread fail, until it is dropped.
+#[cfg(test)]
+pub(crate) struct FailingSpawns(());
+
+#[cfg(test)]
+impl FailingSpawns {
+    pub(crate) fn begin() -> Self {
+        FAILING_SPAWNS.with(|failing| failing.set(true));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailingSpawns {
+    fn drop(&mut self) {
+        FAILING_SPAWNS.with(|failing| failing.set(false));
     }
 }
 

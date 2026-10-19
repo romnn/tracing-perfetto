@@ -1,9 +1,9 @@
 //! Regression tests for the life of a trace's process-memory sampler: none starts once the trace
-//! is finished, a replacement starts only after its predecessor stopped, and a sampler's panic
-//! cannot deadlock a finish.
+//! is finished, a replacement starts only after its predecessor stopped, and neither a sampler's
+//! panic nor its source's drop can deadlock a finish or a replacement.
 
 use crate::process_memory::ProcessMemorySource;
-use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
+use crate::process_memory::sampler::{FailingSpawns, MIN_SAMPLING_INTERVAL};
 use crate::tests::{TestWriter, decode, events_of_type, track_descriptor, track_name, wait_until};
 use crate::{FinishHandle, PerfettoLayer, idl};
 use googletest::prelude::*;
@@ -240,7 +240,12 @@ fn a_replacement_sampler_starts_after_the_replaced_one_stopped() -> Result<()> {
     let observer = layer.finish_handle();
 
     // Replace the sampler on another thread while it is paused in its second read.
-    paused.recv_timeout(BOUND).or_fail()?;
+    if paused.recv_timeout(BOUND).is_err() {
+        // A sampler that pauses later waits for the release, which dropping the layer, which
+        // joins that sampler, would otherwise wait for.
+        drop(release);
+        return fail!("the sampler never paused");
+    }
     let replaced_dropped_at_first_read = Arc::new(OnceLock::new());
     let replacing = ReplacingSource {
         replaced_dropped: Arc::clone(&replaced_dropped),
@@ -397,4 +402,67 @@ fn a_replacement_that_receives_a_sampler_panic_returns() -> Result<()> {
         format!("{observer:?}"),
         eq("FinishHandle { finished: true }")
     )
+}
+
+/// A memory source that finishes the trace when it is dropped, and sends that finish's result.
+struct FinishingSource {
+    /// The handle of the trace that the source samples for, set once the layer is built.
+    finish: Arc<OnceLock<FinishHandle>>,
+    finished: mpsc::Sender<std::io::Result<()>>,
+}
+
+impl ProcessMemorySource for FinishingSource {
+    fn resident_set_size_bytes(&self) -> Option<u64> {
+        Some(FIRST_SOURCE_VALUE)
+    }
+}
+
+impl Drop for FinishingSource {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.get() {
+            // The receiver is gone only after the test stopped waiting.
+            self.finished.send(finish.finish()).ok();
+        }
+    }
+}
+
+/// Installing a sampler whose thread cannot be spawned returns, also when dropping the source
+/// finishes the trace.
+///
+/// The standard library drops the thread's closure, with the source, on the installing thread,
+/// so an installation that still held the sampler's locks then would deadlock in the source's
+/// own finish, which takes them.
+#[gtest]
+fn a_sampler_that_cannot_be_spawned_drops_its_source_after_the_locks() -> Result<()> {
+    let writer = TestWriter::new();
+    let output = writer.make_writer();
+    let layer = PerfettoLayer::new(writer);
+    let finish = Arc::new(OnceLock::new());
+    finish.set(layer.finish_handle()).or_fail()?;
+    let (source_finish_sender, source_finishes) = mpsc::channel();
+    let source = FinishingSource {
+        finish: Arc::clone(&finish),
+        finished: source_finish_sender,
+    };
+
+    let (installed_layer, installed_layers) = mpsc::channel();
+    std::thread::spawn(move || {
+        let failing_spawns = FailingSpawns::begin();
+        let layer = layer.with_process_memory_source(MIN_SAMPLING_INTERVAL, Box::new(source));
+        drop(failing_spawns);
+        // The receiver is gone only after the test stopped waiting.
+        installed_layer.send(layer).ok();
+    });
+    let Ok(layer) = installed_layers.recv_timeout(BOUND) else {
+        return fail!("the installation deadlocked when it dropped the source");
+    };
+    // The source was dropped, and finished the trace, before the installation returned.
+    let Ok(source_finish) = source_finishes.try_recv() else {
+        return fail!("the installation returned before it dropped the source");
+    };
+    drop(layer);
+
+    expect_that!(source_finish, ok(anything()));
+    // Nothing was sampled.
+    verify_that!(counter_samples(&decode(&output)?), is_empty())
 }

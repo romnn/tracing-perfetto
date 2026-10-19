@@ -164,20 +164,27 @@ impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
     /// Calling this again stops the previous sampler and waits for the sample it is reading, if
     /// any, before the new one starts, and the new one continues the previous one's track.
     /// Once the trace is finished, no sampler starts, and `source` is dropped.
+    /// It must not be called from the memory source or from the writer, since it waits for the
+    /// previous sampler, which may be the very thread that calls it.
     #[must_use]
     pub fn with_process_memory_source(
         self,
         interval: Duration,
         source: Box<dyn ProcessMemorySource>,
     ) -> Self {
+        let source: Arc<dyn ProcessMemorySource> = Arc::from(source);
         self.lifecycle.replace_sampler(|| {
             ProcessMemorySampler::spawn(ProcessMemorySamplerConfig {
                 sink: Arc::clone(&self.sink),
                 counter_track: Arc::clone(&self.process_memory_rss_track),
                 interval,
-                source,
+                source: Arc::clone(&source),
             })
         });
+        // The source's `Drop` may finish the trace, which takes the lifecycle's locks, so a source
+        // that no sampler took, such as one whose thread could not be spawned under those locks,
+        // is dropped only here.
+        drop(source);
         self
     }
 }
