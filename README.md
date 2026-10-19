@@ -147,6 +147,9 @@ Dropping the layer ends the trace the same way, but a global dispatcher never dr
 call `finish()` before the process exits.
 After the first failed write the layer writes nothing more, so the file stays readable up to that
 write, and `finish()` returns the error, or else an error of the flush.
+A writer that panics fails the trace the same way: the panic reaches the code that recorded the
+span or event, the layer never calls the writer again, not even to flush it, and `finish()`
+returns an error that says that the writer panicked.
 
 - `tracing_appender::non_blocking` drops messages when its queue is full unless it is built with
   `lossy(false)`, and a dropped message can leave the rest of the trace unreadable.

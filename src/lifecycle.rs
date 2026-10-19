@@ -219,8 +219,14 @@ impl FinishHandle {
     /// output is the trace up to the failed write, followed by whatever part of that write the
     /// writer took.
     /// A failed flush is reported the same way, unless a write failed before.
+    /// A panic of the writer is reported as an error that says that the writer panicked, after
+    /// which the layer never called the writer again, not even to flush it.
     /// Only the first call after the failure returns the error, and later calls return `Ok`.
     /// A call from inside the writer returns `Ok` and leaves the error to a later call.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic of the writer's flush, which a later call reports as an error.
     pub fn finish(&self) -> std::io::Result<()> {
         // Inside the writer, the error is left to a later finish, since taking it would wait for
         // the write that called this, and that write may still fail its flush.

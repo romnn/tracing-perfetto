@@ -14,6 +14,10 @@ use tracing_subscriber::fmt::MakeWriter;
 /// After the first failed write the layer writes nothing more, so the output is the trace up to
 /// that write, followed by whatever part of the failed message the sink took.
 /// [`FinishHandle::finish`](crate::FinishHandle::finish) returns the error.
+/// A sink that panics in a write or flush fails the trace the same way, and the panic propagates
+/// to the code that recorded the span or event, or to the finish that flushed.
+/// The layer never calls a sink that panicked again, not even to flush it, since the panic may
+/// have broken it, as it poisons the `Mutex` of a `Mutex<File>`.
 ///
 /// Every [`MakeWriter`] is a `PerfettoWriter` that writes each buffer with one
 /// [`write_all`](std::io::Write::write_all) call on a fresh writer, such as a
