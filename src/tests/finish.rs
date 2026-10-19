@@ -254,7 +254,8 @@ struct HoldingState {
     output: Mutex<Vec<u8>>,
     /// Announces, once, that a write holds a message.
     held: Mutex<Option<mpsc::Sender<()>>>,
-    /// Releases the held write, behind a mutex because the writer must be [`Sync`].
+    /// Releases the held write when the test sends on it or drops its sender, behind a mutex
+    /// because the writer must be [`Sync`].
     release: Mutex<mpsc::Receiver<()>>,
 }
 
@@ -289,10 +290,12 @@ impl std::io::Write for HoldingWriter {
             .then(|| self.state.held.lock().take())
             .flatten();
         if let Some(held) = held {
-            // The receiver is gone only after the test stopped waiting, and the bound keeps a
-            // test that never releases the write from hanging.
+            // The receiver is gone only after the test stopped waiting.
+            // The write has no deadline of its own, which could release it before a finish
+            // waits for it: a test that fails or panics drops the release's sender, which
+            // releases the write.
             held.send(()).ok();
-            self.state.release.lock().recv_timeout(FINISH_BOUND).ok();
+            self.state.release.lock().recv().ok();
         }
         self.state.output.lock().extend_from_slice(buf);
         Ok(buf.len())
