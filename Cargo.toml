@@ -19,9 +19,11 @@ memory-stats = "1.2"
 parking_lot = "0.12"
 prost = "0.14"
 rand = "0.10"
-thread-id = "5"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "windows"))'.dependencies]
+thread-id = "5"
 
 [dev-dependencies]
 googletest = "0.14"

@@ -272,6 +272,194 @@ fn thread_descriptors_carry_the_os_thread_id_of_each_thread() -> Result<()> {
     Ok(())
 }
 
+/// A thread that reports a given kernel thread ID in place of its own.
+#[derive(Clone, Copy)]
+struct ThreadWithKernelId {
+    /// The name of the thread, which its track takes.
+    name: &'static str,
+    /// The kernel thread ID that the thread reports, or `None` for an unknown one.
+    kernel_thread_id: Option<u64>,
+}
+
+/// Records one event on each of `threads` in turn and decodes the trace.
+fn record_on_threads_with_kernel_ids(threads: &[ThreadWithKernelId]) -> Result<idl::Trace> {
+    let writer = TestWriter::new();
+    let output = writer.make_writer();
+    let dispatch =
+        tracing::Dispatch::new(tracing_subscriber::registry().with(PerfettoLayer::new(writer)));
+    std::thread::scope(|scope| -> Result<()> {
+        for thread in threads {
+            std::thread::Builder::new()
+                .name(thread.name.to_owned())
+                .spawn_scoped(scope, || {
+                    crate::thread_track::override_kernel_thread_id(thread.kernel_thread_id);
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        tracing::info!("on a thread with a given kernel ID");
+                    });
+                })
+                .or_fail()?
+                .join()
+                .or_fail()?;
+        }
+        Ok(())
+    })?;
+    crate::tests::decode(&output)
+}
+
+/// Returns the UUID of the process track that `trace` describes.
+fn process_track_uuid(trace: &idl::Trace) -> Result<u64> {
+    let uuids: Vec<u64> = trace
+        .packet
+        .iter()
+        .filter_map(crate::tests::track_descriptor)
+        .filter(|descriptor| descriptor.process.is_some())
+        .map(idl::TrackDescriptor::uuid)
+        .collect();
+    let [uuid] = uuids[..] else {
+        return Err(format!("expected one process track, got {uuids:?}")).or_fail();
+    };
+    Ok(uuid)
+}
+
+/// Returns the one track descriptor named `name`, checking that exactly one event is on it.
+fn track_with_one_event<'a>(trace: &'a idl::Trace, name: &str) -> Result<&'a idl::TrackDescriptor> {
+    let descriptors: Vec<_> = trace
+        .packet
+        .iter()
+        .filter_map(crate::tests::track_descriptor)
+        .filter(|descriptor| crate::tests::track_name(descriptor) == Some(name))
+        .collect();
+    let [descriptor] = descriptors[..] else {
+        return Err(format!(
+            "expected one track named {name:?}, got {descriptors:?}"
+        ))
+        .or_fail();
+    };
+    let events = trace
+        .packet
+        .iter()
+        .filter_map(crate::tests::track_event)
+        .filter(|event| event.track_uuid == descriptor.uuid)
+        .count();
+    expect_eq!(events, 1, "events on the track named {name:?}");
+    Ok(descriptor)
+}
+
+/// Threads whose kernel thread ID is unknown get distinct tracks that claim no thread ID.
+///
+/// Without the kernel's ID, as on Linux without procfs, a thread descriptor needs a made-up
+/// ID; one that every such thread shares makes their descriptors claim the same thread, and
+/// trace processor merges their tracks.
+#[gtest]
+fn threads_without_a_kernel_thread_id_get_distinct_tracks_without_a_thread_id() -> Result<()> {
+    let trace = record_on_threads_with_kernel_ids(&[
+        ThreadWithKernelId {
+            name: "first without ID",
+            kernel_thread_id: None,
+        },
+        ThreadWithKernelId {
+            name: "second without ID",
+            kernel_thread_id: None,
+        },
+    ])?;
+    let process_track = process_track_uuid(&trace)?;
+    let first = track_with_one_event(&trace, "first without ID")?;
+    let second = track_with_one_event(&trace, "second without ID")?;
+
+    // Each thread's event is on a track of its own.
+    expect_ne!(first.uuid(), second.uuid());
+
+    // Neither track claims a thread, so the two cannot claim the same thread ID, and both sit
+    // below the process track instead.
+    expect_that!(first.thread, none());
+    expect_that!(second.thread, none());
+    expect_that!(first.parent_uuid, some(eq(process_track)));
+    expect_that!(second.parent_uuid, some(eq(process_track)));
+    Ok(())
+}
+
+/// Same-named threads without a kernel thread ID get tracks that never merge with their siblings.
+///
+/// Such a track is a child of the process track, and trace processor merges sibling tracks of the
+/// same name by default, so the threads of a pool, all named `worker`, would share one track.
+#[gtest]
+fn same_named_threads_without_a_kernel_thread_id_get_tracks_that_never_merge() -> Result<()> {
+    let worker = ThreadWithKernelId {
+        name: "worker",
+        kernel_thread_id: None,
+    };
+    let trace = record_on_threads_with_kernel_ids(&[worker, worker])?;
+    let descriptors: Vec<_> = trace
+        .packet
+        .iter()
+        .filter_map(crate::tests::track_descriptor)
+        .filter(|descriptor| crate::tests::track_name(descriptor) == Some("worker"))
+        .collect();
+    let [first, second] = descriptors[..] else {
+        return Err(format!(
+            "expected two tracks named \"worker\", got {descriptors:?}"
+        ))
+        .or_fail();
+    };
+
+    expect_ne!(first.uuid(), second.uuid());
+    for descriptor in [first, second] {
+        expect_eq!(
+            descriptor.sibling_merge_behavior(),
+            idl::track_descriptor::SiblingMergeBehavior::None
+        );
+    }
+    Ok(())
+}
+
+/// A kernel thread ID beyond the trace's 32-bit thread IDs is left out rather than clamped.
+///
+/// Clamping turns every such ID into `i32::MAX`, so the threads would all claim one thread,
+/// and the largest ID that fits would claim it too.
+#[gtest]
+fn kernel_thread_ids_beyond_the_trace_range_are_left_out_rather_than_clamped() -> Result<()> {
+    let largest_trace_thread_id = u64::from(i32::MAX.unsigned_abs());
+    let trace = record_on_threads_with_kernel_ids(&[
+        ThreadWithKernelId {
+            name: "largest fitting ID",
+            kernel_thread_id: Some(largest_trace_thread_id),
+        },
+        ThreadWithKernelId {
+            name: "first ID past the range",
+            kernel_thread_id: Some(largest_trace_thread_id + 1),
+        },
+        ThreadWithKernelId {
+            name: "largest 64-bit ID",
+            kernel_thread_id: Some(u64::MAX),
+        },
+    ])?;
+    let process_track = process_track_uuid(&trace)?;
+    let fitting = track_with_one_event(&trace, "largest fitting ID")?;
+    let past_the_range = track_with_one_event(&trace, "first ID past the range")?;
+    let largest = track_with_one_event(&trace, "largest 64-bit ID")?;
+
+    // The ID that fits is the thread track's own, in this process.
+    let pid = i32::try_from(std::process::id()).or_fail()?;
+    expect_that!(
+        fitting.thread,
+        some(matches_pattern!(idl::ThreadDescriptor {
+            pid: some(eq(&pid)),
+            tid: some(eq(&i32::MAX)),
+            thread_name: some(eq("largest fitting ID")),
+            ..
+        }))
+    );
+
+    // The IDs that do not fit leave their tracks without a thread, below the process track.
+    for descriptor in [past_the_range, largest] {
+        expect_that!(descriptor.thread, none());
+        expect_that!(descriptor.parent_uuid, some(eq(process_track)));
+    }
+    let uuids = HashSet::from([fitting.uuid(), past_the_range.uuid(), largest.uuid()]);
+    expect_eq!(uuids.len(), 3);
+    Ok(())
+}
+
 /// Track and correlation IDs are never 0 and never repeat, also when drawn from many threads.
 ///
 /// Track UUID 0 is invalid, and two spans sharing an ID would share a track or link each
