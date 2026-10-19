@@ -51,8 +51,15 @@
 //! The layer records every span and event that reaches it.
 //! To record only some, give it a [per-layer filter], which leaves the other layers of the
 //! registry unaffected.
-//! A span that the filter rejects has no slices, and its children and events go on the track of
-//! its nearest recorded ancestor instead.
+//! A span that the filter rejects has no slices:
+//!
+//! - Its recorded children nest on the track of its nearest recorded ancestor.
+//! - Its events reach that ancestor's track only while the ancestor is entered on the recording
+//!   thread, as when the rejected span is entered inside it.
+//!   An event that names the rejected span as its explicit parent, or that a task instrumented
+//!   with the rejected span records on another thread, goes on the thread's track ([#11]).
+//! - If no layer of the registry enables the rejected span's callsite, the span does not exist,
+//!   so a span that names it as its explicit parent becomes a root.
 //!
 //! A filter can select by target or level, or by a field that marks the spans and events to
 //! record:
@@ -77,6 +84,7 @@
 //! without a value, as in `#[instrument(fields(perfetto))]`.
 //!
 //! [per-layer filter]: tracing_subscriber::Layer::with_filter
+//! [#11]: https://github.com/romnn/tracing-perfetto/issues/11
 //!
 //! # Process memory and finishing
 //!
