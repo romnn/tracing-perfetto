@@ -1,15 +1,13 @@
 //! Ending a layer's trace, whether the layer is dropped or finished through a [`FinishHandle`].
 
 use crate::process_memory::sampler::ProcessMemorySampler;
-use crate::sink::WriteGate;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::sink::{CloseSink, WriteGate};
+use std::sync::{Arc, Weak};
 
-/// Whether a layer's trace has ended, and the sampler that must stop when it does.
+/// The end of a layer's trace: the sampler that must stop, and the sink that must close.
 ///
 /// The layer and its [`FinishHandle`]s share this state.
 pub(crate) struct TraceLifecycle {
-    finished: AtomicBool,
     /// The sampler, which stays here after it is stopped so that its thread still recognizes
     /// itself while a finish joins it.
     process_memory_sampler: parking_lot::Mutex<Option<ProcessMemorySampler>>,
@@ -19,18 +17,25 @@ pub(crate) struct TraceLifecycle {
     /// The sampler thread never takes it, and the join happens outside the
     /// `process_memory_sampler` lock, which the sampler thread takes when it finishes the trace.
     sampler_join: parking_lot::Mutex<()>,
-    /// The gate of the layer's sink, which holds the first write error for [`FinishHandle`].
+    /// The layer's sink, which a finish closes and flushes.
+    ///
+    /// It is weak so that a [`FinishHandle`] does not keep the writer open after the layer is
+    /// gone.
+    /// The layer closes the sink when it is dropped, so a sink that is gone is closed already.
+    sink: Weak<dyn CloseSink>,
+    /// The gate of the layer's sink, which outlives the sink to hold the first error for
+    /// [`FinishHandle`].
     write_gate: Arc<WriteGate>,
 }
 
 impl TraceLifecycle {
-    /// Returns the lifecycle of a trace that is not finished, written through the sink that
-    /// `write_gate` belongs to.
-    pub(crate) fn new(write_gate: Arc<WriteGate>) -> Self {
+    /// Returns the lifecycle of a trace that is not finished, written through `sink`, whose gate
+    /// is `write_gate`.
+    pub(crate) fn new(sink: Weak<dyn CloseSink>, write_gate: Arc<WriteGate>) -> Self {
         Self {
-            finished: AtomicBool::new(false),
             process_memory_sampler: parking_lot::Mutex::default(),
             sampler_join: parking_lot::Mutex::default(),
+            sink,
             write_gate,
         }
     }
@@ -42,22 +47,36 @@ impl TraceLifecycle {
         }
     }
 
-    /// Ends the trace and waits for the process-memory sampler, if one runs, to stop.
+    /// Ends the trace: stops the process-memory sampler, if one runs, and waits for it, then
+    /// waits for the writes in progress, stops all later writes and flushes the writer.
     ///
-    /// Spans and events stop being written before the wait, which lasts only for a sample in
-    /// progress.
-    /// On the sampler thread, which cannot wait for itself, this returns at once, and the sampler
-    /// writes no further sample.
+    /// Spans and events are written until the sink closes, which happens after the sampler
+    /// stopped.
+    /// On the sampler thread, which cannot wait for itself, this does not wait for the sampler,
+    /// which writes no further sample.
+    /// Inside a call to the writer, on any thread, this neither waits for the sampler, which may
+    /// wait for that call, nor for the sink, whose lock that call holds: it requests both to
+    /// stop, and the sink closes and flushes when that call returns.
     pub(crate) fn finish(&self) {
-        self.finished.store(true, Ordering::Release);
+        let inside_writer = self.write_gate.is_writing_on_current_thread();
+        self.stop_sampler(inside_writer);
+        if inside_writer {
+            self.write_gate.request_close();
+        } else if let Some(sink) = self.sink.upgrade() {
+            sink.close();
+        }
+    }
 
-        // Sampler thread
+    /// Stops the sampler, and waits for it unless the calling thread is the sampler thread or
+    /// `inside_writer` says that it is inside a call to the writer.
+    fn stop_sampler(&self, inside_writer: bool) {
+        // Sampler thread, or inside the writer
         {
             let mut sampler = self.process_memory_sampler.lock();
             let Some(sampler) = sampler.as_mut() else {
                 return;
             };
-            if sampler.runs_on_current_thread() {
+            if inside_writer || sampler.runs_on_current_thread() {
                 sampler.request_stop();
                 return;
             }
@@ -77,7 +96,7 @@ impl TraceLifecycle {
 
     /// Returns whether the trace has ended, after which the layer writes nothing.
     pub(crate) fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
+        self.write_gate.is_closed()
     }
 
     /// Makes `sampler` the trace's sampler, and stops and joins the one it replaces.
@@ -92,8 +111,8 @@ impl TraceLifecycle {
 /// Ends a [`PerfettoLayer`](crate::PerfettoLayer)'s trace while something else still owns the
 /// layer.
 ///
-/// A layer inside a process-global dispatcher is never dropped, so its owner finishes the trace
-/// through this handle instead.
+/// A layer inside a process-global dispatcher is never dropped, so its owner finishes the trace,
+/// which flushes the writer, through this handle instead.
 /// Clones finish the same trace.
 #[derive(Clone)]
 pub struct FinishHandle {
@@ -109,20 +128,28 @@ impl std::fmt::Debug for FinishHandle {
 }
 
 impl FinishHandle {
-    /// Stops the layer from writing, joins its process-memory sampler, and reports a failed
-    /// write.
+    /// Ends the trace: stops the process-memory sampler, waits for the writes under way, flushes
+    /// the writer, and reports a failed write or flush.
     ///
-    /// Spans and events recorded afterwards are discarded.
-    /// Concurrent finishes each return only after the sampler has stopped.
-    /// Called from the sampler thread, by a [`ProcessMemorySource`] or the writer, it returns
-    /// without waiting for the sampler, which then writes no further sample.
-    /// A write already under way can still land after this returns, and the writer is not
-    /// flushed ([#5]).
+    /// When this returns, the sampler has stopped, each write of the layer has either reached the
+    /// writer or been discarded, and the writer is flushed, so the output holds the whole trace.
+    /// Nothing is written afterwards: spans and events recorded while this runs may land, and
+    /// those recorded later are discarded.
+    /// Concurrent finishes each return only once all of that holds.
     /// Finishing again has no further effect.
     ///
-    /// Dropping the layer ends the trace too, but only this reports a write error.
+    /// Called from the sampler thread, by a [`ProcessMemorySource`], it ends the trace without
+    /// waiting for the sampler, which then writes no further sample.
+    /// Called from inside the writer, on any thread, it returns at once, because it cannot wait
+    /// for the write that called it: it asks the sampler to stop, and the trace ends and the
+    /// writer is flushed when that write returns.
+    /// A later finish waits for the sampler and reports an error of that write or flush.
     ///
-    /// [#5]: https://github.com/romnn/tracing-perfetto/issues/5
+    /// Dropping the layer ends the trace and flushes the writer too, but only this reports an
+    /// error.
+    /// A global dispatcher never drops its layer, so finish a trace recorded there through this
+    /// handle.
+    ///
     /// [`ProcessMemorySource`]: crate::process_memory::ProcessMemorySource
     ///
     /// # Errors
@@ -130,6 +157,7 @@ impl FinishHandle {
     /// Returns the first error of the writer, after which the layer wrote nothing more, so the
     /// output is the trace up to the failed write, followed by whatever part of that write the
     /// writer took.
+    /// A failed flush is reported the same way, unless a write failed before.
     /// Only the first call after the failure returns the error, and later calls return `Ok`.
     pub fn finish(&self) -> std::io::Result<()> {
         self.lifecycle.finish();

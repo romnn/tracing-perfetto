@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info_span!("work", perfetto.track_name = "jobs").in_scope(|| {
         tracing::info!("working");
     });
-    // Reports the first failed write, after which the layer wrote nothing more.
+    // Ends the trace, flushes the writer, and reports the first failed write or flush.
     finish.finish()?;
     Ok(())
 }
@@ -140,28 +140,31 @@ Issue [#11] tracks routing the events of a rejected span to its nearest recorded
 
 The layer writes each encoded `Trace` message as it happens, through one `write_all` call, so a
 trace cut short still holds everything written so far.
-A `Mutex<File>` is the usual writer.
+A `Mutex<File>` is the usual writer, and a `Mutex<BufWriter<File>>` writes fewer, larger chunks.
+`FinishHandle::finish` is the end of the trace: it waits for the writes under way, flushes the
+writer, and the layer writes nothing afterwards.
+Dropping the layer ends the trace the same way, but a global dispatcher never drops its layer, so
+call `finish()` before the process exits.
 After the first failed write the layer writes nothing more, so the file stays readable up to that
-write, and `FinishHandle::finish` returns the error.
+write, and `finish()` returns the error, or else an error of the flush.
 
-- A buffering writer such as `BufWriter` keeps the end of the trace until it is flushed, and the
-  layer never flushes it ([#5]).
 - `tracing_appender::non_blocking` drops messages when its queue is full unless it is built with
   `lossy(false)`, and a dropped message can leave the rest of the trace unreadable.
-  Drop its `WorkerGuard` after `finish()`: dropping the guard flushes the queue, but it waits
-  about a second at most, so a large backlog can still lose its tail.
+  Its flush does not wait for the queue, so drop its `WorkerGuard` after `finish()`: dropping the
+  guard flushes the queue, but it waits about a second at most, so a large backlog can still lose
+  its tail.
 - The writer must not record spans or events: the layer calls it while holding the lock that
   every write of the trace takes, so a span or event that the writer records deadlocks.
+- The writer may call `finish()` from inside its own write, which returns at once and ends the
+  trace when that write returns, but it must not wait for a `finish()` on another thread, which
+  waits for the write in progress.
 
 ## Known limitations
 
-- `FinishHandle::finish` stops new writes, but a write already under way can still land after it
-  returns, and the writer is not flushed ([#5]).
 - With tracing-subscriber 0.3.23, a child span that closes on a thread whose default dispatcher
   is another one leaves its parent's lifetime slice without an end, or panics (see
   [Installing](#installing), [#9]).
 
-[#5]: https://github.com/romnn/tracing-perfetto/issues/5
 [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 [tokio-rs/tracing#2870]: https://github.com/tokio-rs/tracing/issues/2870
 [#11]: https://github.com/romnn/tracing-perfetto/issues/11

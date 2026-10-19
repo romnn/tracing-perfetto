@@ -34,8 +34,8 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 /// Timestamps come from a monotonic clock that the trace maps onto wall-clock time.
 /// Several layers can share one registry, and each writes a trace that opens on its own.
 ///
-/// Dropping the layer, or finishing it through a [`FinishHandle`], ends the trace, with the
-/// [limitations](crate#limitations) that the crate documents.
+/// Dropping the layer, or finishing it through a [`FinishHandle`], ends the trace and flushes the
+/// writer, with the [limitations](crate#limitations) that the crate documents.
 pub struct PerfettoLayer<W> {
     layer_id: LayerId,
     /// The sink that the layer and its process-memory sampler write through.
@@ -64,19 +64,24 @@ impl Default for Config {
     }
 }
 
-impl<W: PerfettoWriter> PerfettoLayer<W> {
+impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
     /// Creates a layer that writes encoded trace packets to `writer`.
     ///
     /// Spans are recorded as lifetime and entered slices, debug annotations start disabled, and
     /// no process memory is sampled.
+    ///
+    /// The writer is shared with every [`FinishHandle`], which flushes it from whichever thread
+    /// finishes the trace, so it must be [`Send`] and [`Sync`], as any layer of a
+    /// [`Dispatch`](tracing::Dispatch) must be anyway.
     #[must_use]
     pub fn new(writer: W) -> Self {
         let layer_id = LayerId::next();
-        let sink = TraceSink::new(writer);
-        let lifecycle = Arc::new(TraceLifecycle::new(Arc::clone(sink.gate())));
+        let sink = Arc::new(TraceSink::new(writer));
+        let weak_sink = Arc::downgrade(&sink);
+        let lifecycle = Arc::new(TraceLifecycle::new(weak_sink, Arc::clone(sink.gate())));
         Self {
             layer_id,
-            sink: Arc::new(sink),
+            sink,
             config: Config::default(),
             threads: ThreadStates::new(layer_id),
             process_memory_rss_track_uuid: packets::unique_uuid(),
@@ -142,10 +147,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// through a [`FinishHandle`], which stops it without waiting for the rest of its interval.
     /// An `interval` shorter than one millisecond samples every millisecond.
     #[must_use]
-    pub fn with_process_memory_rss(self, interval: Duration) -> Self
-    where
-        W: Send + Sync + 'static,
-    {
+    pub fn with_process_memory_rss(self, interval: Duration) -> Self {
         let Some(source) = process_memory::default_process_memory_source() else {
             return self;
         };
@@ -166,10 +168,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self,
         interval: Duration,
         source: Box<dyn ProcessMemorySource>,
-    ) -> Self
-    where
-        W: Send + Sync + 'static,
-    {
+    ) -> Self {
         let sampler = ProcessMemorySampler::spawn(ProcessMemorySamplerConfig {
             sink: Arc::clone(&self.sink),
             counter_track_uuid: self.process_memory_rss_track_uuid,
@@ -179,16 +178,16 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self.lifecycle.replace_sampler(sampler);
         self
     }
+}
 
+impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// Writes `trace_packets` as one `Trace` message, unless the trace is finished, and returns
     /// whether the message was written.
     ///
     /// Every packet of the layer reaches the writer through here or through the sampler, both of
-    /// which write through the [`TraceSink`], so the sequence's preamble precedes them.
+    /// which write through the [`TraceSink`], so the sequence's preamble precedes them, and none
+    /// follows the end of the trace.
     fn write_packets(&self, trace_packets: Vec<idl::TracePacket>) -> bool {
-        if self.lifecycle.is_finished() {
-            return false;
-        }
         self.sink.write(&idl::Trace {
             packet: trace_packets,
         })
@@ -201,9 +200,6 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// The events share one timestamp, so slices that a non-LIFO exit ends and begins again
     /// resume exactly where they ended.
     fn write_on_thread_track(&self, events: Vec<UnplacedEvent>) {
-        if self.lifecycle.is_finished() {
-            return;
-        }
         let track_uuid = thread_track::current_thread_uuid();
         let mut trace_packets = Vec::with_capacity(events.len() + 1);
 
@@ -426,7 +422,7 @@ where
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        if !self.config.thread_slices || self.lifecycle.is_finished() {
+        if !self.config.thread_slices {
             return;
         }
         let Some(span) = ctx.span(id) else {
