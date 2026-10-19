@@ -107,14 +107,30 @@ fn kernel_thread_id() -> Option<u64> {
     (pid == std::process::id() && task == "task" && complete).then_some(tid)
 }
 
-/// Returns [`thread_id::get`], which is the kernel thread ID on macOS and Windows.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// Returns [`thread_id::get`], which is the kernel thread ID on these platforms.
+///
+/// `thread_id::get` reads `pthread_threadid_np` on macOS, iOS, tvOS and watchOS, and
+/// `GetCurrentThreadId` on Windows; on any other Apple platform it returns the `pthread_t` address.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "windows"
+))]
 fn kernel_thread_id() -> Option<u64> {
     u64::try_from(thread_id::get()).ok()
 }
 
 /// Returns `None`, since the kernel thread ID has no known source on this platform.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "windows"
+)))]
 fn kernel_thread_id() -> Option<u64> {
     None
 }
