@@ -99,7 +99,9 @@ impl WriteGate {
     }
 
     /// Returns whether the calling thread is inside a call to the writer, holding the state lock.
-    fn is_calling_writer(&self) -> bool {
+    ///
+    /// Nothing that the thread records there is written, see [`TraceSink::write`].
+    pub(crate) fn is_calling_writer(&self) -> bool {
         self.writer_call
             .lock()
             .as_ref()

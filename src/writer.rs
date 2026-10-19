@@ -42,6 +42,8 @@ use tracing_subscriber::fmt::MakeWriter;
 /// Spans and events that a sink records while the layer calls it, on that thread, as a panic
 /// hook that records the sink's panic does, are not written: the layer calls the sink while
 /// holding the lock that every write of the trace takes, which their writes cannot wait for.
+/// This holds only for the sink's own layer, so a sink must not record into another
+/// tracing-perfetto layer, whose sink may wait for this one in the same way.
 /// A sink may finish the trace from inside a write or flush, on the thread that the layer calls
 /// it on: that finish returns at once, and the trace ends when the write returns.
 /// A sink must not wait for a finish on another thread, including one that it spawns and joins,

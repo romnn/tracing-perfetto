@@ -161,6 +161,8 @@ panic unwinds is caught, since a second panic there aborts the process.
 - Spans and events that the writer records while the layer calls it, such as through a panic
   hook that records the writer's panic, are not written: the layer calls the writer while
   holding the lock that every write of the trace takes, which their writes cannot wait for.
+  This holds only for the writer's own layer, so a writer must not record into another
+  tracing-perfetto layer, whose writer may wait for this one in the same way.
 - The writer may call `finish()` from inside its own write, on the thread that the layer calls
   it on, which returns at once and ends the trace when that write returns, but it must not wait
   for a `finish()` on another thread, including one that it spawns and joins, which waits for the
