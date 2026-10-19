@@ -4,10 +4,10 @@ use crate::process_memory::ProcessMemorySource;
 use crate::sink::TraceSink;
 use crate::writer::PerfettoWriter;
 use crate::{idl, packets};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
-use std::thread::{JoinHandle, ThreadId};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// The shortest interval between two samples, which keeps a zero interval from sampling in a
@@ -55,9 +55,12 @@ pub(crate) struct ProcessMemorySampler {
     /// The sampler thread, until [`Self::stop`] hands it out to be joined, or `None` if it could
     /// not be spawned.
     join_handle: Option<JoinHandle<()>>,
-    /// The ID of the sampler thread, which outlives `join_handle` so that the thread still
-    /// recognizes itself while another thread joins it.
-    thread_id: Option<ThreadId>,
+    /// The [`thread_id::get`] of the sampler thread, which the thread stores before it first
+    /// reads its source, or `None` if the thread could not be spawned.
+    ///
+    /// It outlives `join_handle` so that the thread still recognizes itself while another
+    /// thread joins it.
+    thread_id: Option<Arc<OnceLock<usize>>>,
 }
 
 impl ProcessMemorySampler {
@@ -75,8 +78,12 @@ impl ProcessMemorySampler {
     {
         let (stop, stopped) = mpsc::channel::<()>();
         let interval = sampling_interval(config.interval);
+        let thread_id = Arc::new(OnceLock::new());
+        let sampler_thread_id = Arc::clone(&thread_id);
 
         let join_handle = spawn_thread(move || {
+            // Stored before the source or the writer can call back into the layer.
+            sampler_thread_id.get_or_init(thread_id::get);
             loop {
                 let rss_bytes = config.source.resident_set_size_bytes();
                 // A stop requested while the source was read, possibly by the source
@@ -95,7 +102,7 @@ impl ProcessMemorySampler {
             }
         })
         .ok();
-        let thread_id = join_handle.as_ref().map(|handle| handle.thread().id());
+        let thread_id = join_handle.is_some().then_some(thread_id);
 
         Self {
             stop: Some(stop),
@@ -106,8 +113,17 @@ impl ProcessMemorySampler {
 
     /// Returns whether the calling thread is the sampler thread, which happens when its source
     /// or writer calls back into the layer.
+    ///
+    /// It reads no thread-local value, so it also answers from a destructor that runs after the
+    /// thread's handle is gone, where [`std::thread::current`] panics.
+    /// Such an ID is unique only among threads that have not exited, so a later thread that
+    /// reuses the ID of an exited sampler thread is taken for it, which merely skips waiting for a
+    /// thread that writes nothing more.
     pub(crate) fn runs_on_current_thread(&self) -> bool {
-        self.thread_id == Some(std::thread::current().id())
+        self.thread_id
+            .as_ref()
+            .and_then(|thread_id| thread_id.get())
+            .is_some_and(|&thread_id| thread_id == thread_id::get())
     }
 
     /// Wakes the thread so that it stops, without waiting for it.

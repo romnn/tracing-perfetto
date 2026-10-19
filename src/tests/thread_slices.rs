@@ -903,3 +903,70 @@ fn polls_of_concurrent_tokio_tasks_keep_every_track_nested() -> Result<()> {
     expect_eq!(entered_ids, lifetime_ids);
     Ok(())
 }
+
+/// A writer that enters and exits a given span inside its next write.
+struct ReenteringWriter {
+    output: TestWriter,
+    /// The span to enter, until a write has entered it.
+    span: Arc<parking_lot::Mutex<Option<tracing::Span>>>,
+}
+
+impl<'a> MakeWriter<'a> for ReenteringWriter {
+    type Writer = ReenteringWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        ReenteringWriter {
+            output: self.output.make_writer(),
+            span: Arc::clone(&self.span),
+        }
+    }
+}
+
+impl std::io::Write for ReenteringWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let span = self.span.lock().take();
+        if let Some(span) = span {
+            span.in_scope(|| {});
+        }
+        self.output.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+/// A span that the writer enters and exits while the layer calls it keeps the slice of its
+/// entry outside the writer open until that entry's own exit.
+///
+/// The layer writes nothing of an entry inside the writer, so an exit there that ended the
+/// innermost slice of the span would end the outer slice early, and the end of the outer slice,
+/// written inside the writer, would be dropped, leaving it unfinished.
+#[gtest]
+fn a_span_that_the_writer_reenters_keeps_its_slice_until_its_own_exit() -> Result<()> {
+    let output = TestWriter::new();
+    let span_slot = Arc::new(parking_lot::Mutex::new(None));
+    let writer = ReenteringWriter {
+        output: output.make_writer(),
+        span: Arc::clone(&span_slot),
+    };
+    let layer = PerfettoLayer::new(writer);
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+    let span = trace_span!("reentered_by_the_writer");
+    let entered = span.enter();
+    *span_slot.lock() = Some(span.clone());
+    tracing::info!(parent: None, marker = "written while the writer reenters");
+    drop(entered);
+
+    let trace = decode(&output)?;
+    let slices = replay_slices(&trace)?;
+    let [thread_track] = thread_track_uuids(&trace)[..] else {
+        return fail!("expected one thread track");
+    };
+    expect_that!(span_slot.lock().as_ref(), none());
+    expect_that!(
+        nesting(&slices_on(&slices, thread_track)),
+        elements_are![eq(&ended("reentered_by_the_writer", 0))]
+    );
+    Ok(())
+}

@@ -408,6 +408,14 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        // An event that the writer records while the layer calls it is not written, so its
+        // packets are not built either.
+        // Building them may describe the thread's track, which looks up the thread's name
+        // through `std::thread::current`, and that panics in a destructor that runs after the
+        // thread's handle is gone, such as one that finishes the trace and so flushes the writer.
+        if self.sink.gate().is_calling_writer() {
+            return;
+        }
         let metadata = event.metadata();
         let mut debug_annotations = DebugAnnotations::default();
         if self.config.debug_annotations {
@@ -439,7 +447,10 @@ where
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        if !self.config.thread_slices {
+        // The writer's entries are skipped for the same reason as its events, and its exits with
+        // them, so that an exit inside the writer never ends a slice that an entry outside it
+        // began.
+        if !self.config.thread_slices || self.sink.gate().is_calling_writer() {
             return;
         }
         let Some(span) = ctx.span(id) else {
@@ -466,7 +477,7 @@ where
     }
 
     fn on_exit(&self, id: &Id, _ctx: Context<'_, S>) {
-        if !self.config.thread_slices {
+        if !self.config.thread_slices || self.sink.gate().is_calling_writer() {
             return;
         }
         // Only the thread's own stack decides what ends, because the exiting span may be closed
