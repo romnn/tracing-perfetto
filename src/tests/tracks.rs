@@ -432,6 +432,49 @@ fn unscoped_events_go_to_the_thread_track() -> Result<()> {
     Ok(())
 }
 
+/// A span with both `perfetto.track_name` and `otel.name` names its track after the track name
+/// and its slices after `otel.name`.
+///
+/// The track name names only the span's track, so slices named after it would lose the name
+/// that `otel.name` gives the span, and a track named after `otel.name` would not merge with
+/// the other tracks of the track name.
+#[gtest]
+fn track_name_names_the_track_and_otel_name_the_slices() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+    let otel_name = String::from("otel-name");
+    trace_span!(
+        "static_span",
+        { "perfetto.track_name" } = "my-task",
+        { "otel.name" } = %otel_name
+    )
+    .in_scope(|| {});
+
+    let trace = decode(&output)?;
+    let slices = replay_slices(&trace)?;
+
+    // The span's only track is named after the track name.
+    let track = span_track_named(&trace, "my-task")?;
+    expect_that!(span_track_descriptors(&trace), len(eq(1)));
+
+    // The lifetime slice on that track and the entered slice are named after `otel.name`.
+    expect_that!(
+        slices
+            .iter()
+            .map(|slice| slice.name.as_str())
+            .collect::<Vec<_>>(),
+        elements_are![eq(&"otel-name"), eq(&"otel-name")]
+    );
+    expect_eq!(
+        replay_lifetime_slices(&trace)?
+            .first()
+            .map(|lifetime| lifetime.track_uuid),
+        Some(track)
+    );
+    Ok(())
+}
+
 /// Fields recorded after a span's creation are annotations on its slice's end.
 ///
 /// The begin is already written when a field is recorded, so a recorded value kept anywhere but

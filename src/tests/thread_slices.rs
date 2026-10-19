@@ -49,16 +49,42 @@ fn slices_on(slices: &[ReplayedSlice], track_uuid: u64) -> Vec<&ReplayedSlice> {
         .collect()
 }
 
-/// Returns each slice's name, depth and whether it ended, which together show its nesting.
-fn nesting<'a>(slices: &[&'a ReplayedSlice]) -> Vec<(&'a str, usize, bool)> {
+/// Where a slice sits in the nesting of its track.
+#[derive(Debug, PartialEq, Eq)]
+struct Nesting<'a> {
+    name: &'a str,
+    /// The number of slices that enclose the slice on its track.
+    depth: usize,
+    /// Whether the trace holds the slice's end.
+    ended: bool,
+}
+
+/// Returns the nesting of a slice named `name` at `depth` that has ended.
+fn ended(name: &str, depth: usize) -> Nesting<'_> {
+    Nesting {
+        name,
+        depth,
+        ended: true,
+    }
+}
+
+/// Returns the nesting of a slice named `name` at `depth` that is still open.
+fn open(name: &str, depth: usize) -> Nesting<'_> {
+    Nesting {
+        name,
+        depth,
+        ended: false,
+    }
+}
+
+/// Returns the nesting of each of `slices`.
+fn nesting<'a>(slices: &[&'a ReplayedSlice]) -> Vec<Nesting<'a>> {
     slices
         .iter()
-        .map(|slice| {
-            (
-                slice.name.as_str(),
-                slice.depth,
-                slice.end_timestamp.is_some(),
-            )
+        .map(|slice| Nesting {
+            name: slice.name.as_str(),
+            depth: slice.depth,
+            ended: slice.end_timestamp.is_some(),
         })
         .collect()
 }
@@ -149,11 +175,7 @@ fn nested_entered_spans_nest_on_the_thread_track() -> Result<()> {
     let on_thread = slices_on(&slices, thread_track);
     expect_that!(
         nesting(&on_thread),
-        elements_are![
-            eq(&("a", 0, true)),
-            eq(&("b", 1, true)),
-            eq(&("c", 2, true))
-        ]
+        elements_are![eq(&ended("a", 0)), eq(&ended("b", 1)), eq(&ended("c", 2))]
     );
 
     // Each slice lies within the slice that encloses it.
@@ -304,9 +326,9 @@ fn out_of_order_exit_resumes_the_slices_entered_after_it() -> Result<()> {
     expect_that!(
         nesting(&on_thread),
         elements_are![
-            eq(&("outer", 0, true)),
-            eq(&("inner", 1, true)),
-            eq(&("inner", 0, true))
+            eq(&ended("outer", 0)),
+            eq(&ended("inner", 1)),
+            eq(&ended("inner", 0))
         ]
     );
     let [outer_slice, inner_before, inner_after] = on_thread[..] else {
@@ -354,7 +376,7 @@ fn reentered_span_nests_a_slice_inside_its_own() -> Result<()> {
     let on_thread = slices_on(&slices, thread_track);
     expect_that!(
         nesting(&on_thread),
-        elements_are![eq(&("reentered", 0, true)), eq(&("reentered", 1, true))]
+        elements_are![eq(&ended("reentered", 0)), eq(&ended("reentered", 1))]
     );
 
     // The inner slice ends at the first exit and the outer slice at the second.
@@ -402,7 +424,7 @@ fn span_entered_on_two_threads_at_once_nests_on_each() -> Result<()> {
         let on_thread = slices_on(&slices, thread_track_named(&trace, thread_name)?);
         expect_that!(
             nesting(&on_thread),
-            elements_are![eq(&("shared", 0, true))],
+            elements_are![eq(&ended("shared", 0))],
             "on {thread_name}"
         );
         expect_that!(
@@ -677,7 +699,7 @@ fn exit_after_finish_writes_nothing() -> Result<()> {
     };
     expect_that!(
         nesting(&slices_on(&slices, thread_track)),
-        elements_are![eq(&("finished", 0, false))]
+        elements_are![eq(&open("finished", 0))]
     );
     Ok(())
 }
@@ -703,7 +725,7 @@ fn span_entered_at_thread_exit_keeps_an_unfinished_slice() -> Result<()> {
     let thread_track = thread_track_named(&trace, "exiting thread")?;
     expect_that!(
         nesting(&slices_on(&slices, thread_track)),
-        elements_are![eq(&("left_entered", 0, false))]
+        elements_are![eq(&open("left_entered", 0))]
     );
     Ok(())
 }
@@ -741,12 +763,12 @@ fn later_thread_does_not_inherit_the_state_of_an_exited_thread() -> Result<()> {
     let later_track = thread_track_named(&trace, "later thread")?;
     expect_that!(
         nesting(&slices_on(&slices, later_track)),
-        elements_are![eq(&("own", 0, true))]
+        elements_are![eq(&ended("own", 0))]
     );
     let exited_track = thread_track_named(&trace, "exited thread")?;
     expect_that!(
         nesting(&slices_on(&slices, exited_track)),
-        elements_are![eq(&("left_entered", 0, false))]
+        elements_are![eq(&open("left_entered", 0))]
     );
     Ok(())
 }
@@ -787,7 +809,7 @@ fn layers_on_one_registry_keep_separate_entered_stacks() -> Result<()> {
     };
     expect_that!(
         nesting(&slices_on(&first_slices, first_thread_track)),
-        elements_are![eq(&("both", 0, true))]
+        elements_are![eq(&ended("both", 0))]
     );
 
     let second = decode(&second_output)?;
@@ -798,9 +820,9 @@ fn layers_on_one_registry_keep_separate_entered_stacks() -> Result<()> {
     expect_that!(
         nesting(&slices_on(&second_slices, second_thread_track)),
         elements_are![
-            eq(&("both", 0, true)),
-            eq(&("second_only", 1, true)),
-            eq(&("second_only", 0, true))
+            eq(&ended("both", 0)),
+            eq(&ended("second_only", 1)),
+            eq(&ended("second_only", 0))
         ]
     );
     Ok(())

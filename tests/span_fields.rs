@@ -36,36 +36,6 @@ impl std::io::Write for TestWriter {
     }
 }
 
-/// A span with both `perfetto.track_name` and `otel.name` takes its slice name from `otel.name`.
-///
-/// The track name names only the span's track, so its slices keep a name of their own.
-#[gtest]
-fn test_span_slice_name_override_prefers_perfetto_track_name() -> Result<()> {
-    let writer = TestWriter::default();
-    let extra_writer = writer.clone();
-    let perfetto_layer = PerfettoLayer::new(writer).with_debug_annotations(true);
-    let subscriber = tracing_subscriber::registry().with(perfetto_layer);
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    {
-        let otel_name = String::from("otel-name");
-        let demo_span = trace_span!(
-            "static_span",
-            {"perfetto.track_name"} = "my-task",
-            {"otel.name"} = %otel_name
-        );
-        let _enter = demo_span.enter();
-    }
-
-    let buf = extra_writer.buf.lock();
-    expect_that!(buf.as_slice(), not(is_empty()));
-
-    // Only the begins of the lifetime slice and the entered slice name them.
-    let names = decode_track_event_names(&buf).or_fail()?;
-    expect_eq!(names, ["otel-name", "otel-name"]);
-    Ok(())
-}
-
 /// A span with `otel.name` and no track name takes its slice name from `otel.name`.
 #[gtest]
 fn test_span_slice_name_override_uses_otel_name_when_no_track_name() -> Result<()> {
