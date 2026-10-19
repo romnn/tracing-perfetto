@@ -135,7 +135,8 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// The samples come from [`process_memory::default_process_memory_source`].
     /// On a platform it does not support, the layer is returned unchanged.
     /// The sampler runs on its own thread until the layer is dropped or its trace is finished
-    /// through a [`FinishHandle`].
+    /// through a [`FinishHandle`], which stops it without waiting for the rest of its interval.
+    /// An `interval` shorter than one millisecond samples every millisecond.
     #[must_use]
     pub fn with_process_memory_rss(self, interval: Duration) -> Self
     where
@@ -150,7 +151,8 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// Samples the resident set size from `source` every `interval` onto a `process.rss` counter
     /// track.
     ///
-    /// Intervals in which `source` reports no value are skipped.
+    /// Intervals in which `source` reports no value are skipped, and an `interval` shorter than
+    /// one millisecond samples every millisecond.
     /// Calling this again stops and joins the previous sampler before the new one takes over.
     #[must_use]
     pub fn with_process_memory_source(

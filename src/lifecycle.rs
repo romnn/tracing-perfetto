@@ -23,8 +23,8 @@ impl TraceLifecycle {
 
     /// Ends the trace and joins the process-memory sampler, if one runs.
     ///
-    /// Spans and events stop being written before the join, which waits for the sampler's
-    /// current interval.
+    /// Spans and events stop being written before the join, which waits only for a sample in
+    /// progress.
     pub(crate) fn finish(&self) {
         self.finished.store(true, Ordering::Release);
         if let Some(sampler) = self.process_memory_sampler.lock().take() {

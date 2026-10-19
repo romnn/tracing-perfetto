@@ -3,10 +3,12 @@
 use crate::PerfettoLayer;
 use crate::idl;
 use crate::idl::track_event;
+use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
 use crate::tests::TestWriter;
 use googletest::prelude::*;
 use prost::Message;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use tracing::{field, trace_span};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::filter_fn;
@@ -218,4 +220,103 @@ fn cloned_finish_handle_finishes_the_same_trace() {
 
     expect_eq!(output.buf.lock().len(), written);
     expect_eq!(format!("{finish:?}"), "FinishHandle { finished: true }");
+}
+
+/// A memory source that reports 1 KiB and announces each sample it reports.
+struct AnnouncingProcessMemory {
+    announcements: mpsc::Sender<()>,
+}
+
+impl crate::process_memory::ProcessMemorySource for AnnouncingProcessMemory {
+    fn resident_set_size_bytes(&self) -> Option<u64> {
+        // The receiver is gone only after the test stopped waiting for samples.
+        self.announcements.send(()).ok();
+        Some(1024)
+    }
+}
+
+/// Returns a layer that samples an announcing memory source every `interval`, and the receiver
+/// of the source's announcements.
+fn announcing_layer(
+    writer: TestWriter,
+    interval: Duration,
+) -> (PerfettoLayer<TestWriter>, mpsc::Receiver<()>) {
+    let (announcements, announced) = mpsc::channel();
+    let layer = PerfettoLayer::new(writer).with_process_memory_source(
+        interval,
+        Box::new(AnnouncingProcessMemory { announcements }),
+    );
+    (layer, announced)
+}
+
+/// Finishing a trace stops a sampler that waits for its next sample without waiting for the rest
+/// of its interval.
+///
+/// A sampler that slept through its interval before noticing the stop would block the finish, and
+/// a process that finishes its trace at exit, for an hour with this interval.
+#[gtest]
+fn finish_stops_the_sampler_without_waiting_for_its_interval() -> Result<()> {
+    let (layer, announced) = announcing_layer(TestWriter::new(), Duration::from_secs(3600));
+    let finish = layer.finish_handle();
+
+    // After its first sample, the sampler waits an hour for the next one.
+    announced.recv().or_fail()?;
+    let (finished, finished_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        finish.finish();
+        finished.send(()).ok();
+    });
+
+    // The bound is far above any scheduling delay and far below the interval.
+    let finished_in_time = finished_receiver
+        .recv_timeout(Duration::from_secs(30))
+        .is_ok();
+    if !finished_in_time {
+        // Dropping the layer would finish it too, which waits for the stuck finish.
+        std::mem::forget(layer);
+    }
+    verify_true!(finished_in_time)
+}
+
+/// A zero sampling interval samples at most once per millisecond.
+///
+/// A sampler that waited for exactly the requested interval would sample in a busy loop, taking
+/// a CPU core and flooding the trace with samples.
+#[gtest]
+fn zero_interval_samples_at_most_once_per_millisecond() -> Result<()> {
+    let writer = TestWriter::new();
+    let output = writer.make_writer();
+    let (layer, announced) = announcing_layer(writer, Duration::ZERO);
+    let finish = layer.finish_handle();
+
+    // The fourth announcement proves that the first three samples were written.
+    for _ in 0..4 {
+        announced.recv().or_fail()?;
+    }
+    finish.finish();
+
+    // Consecutive samples lie at least the minimum interval apart.
+    let trace = idl::Trace::decode(output.buf.lock().as_slice()).or_fail()?;
+    let sample_timestamps: Vec<u64> = trace
+        .packet
+        .iter()
+        .filter(|packet| {
+            matches!(
+                &packet.data,
+                Some(idl::trace_packet::Data::TrackEvent(event))
+                    if event.r#type() == track_event::Type::Counter
+            )
+        })
+        .filter_map(|packet| packet.timestamp)
+        .collect();
+    expect_that!(sample_timestamps, len(ge(3)));
+    let min_interval_nanos = u64::try_from(MIN_SAMPLING_INTERVAL.as_nanos()).or_fail()?;
+    for pair in sample_timestamps.windows(2) {
+        let [earlier, later] = pair else {
+            return fail!("expected a pair of timestamps");
+        };
+        expect_that!(later.saturating_sub(*earlier), ge(min_interval_nanos));
+    }
+    drop(layer);
+    Ok(())
 }
