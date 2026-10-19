@@ -124,13 +124,18 @@
 //!   parent's ID.
 //!
 //! Under a scoped default, drop spans only where their dispatcher is the default.
-//! Attach it to futures that run on other threads with [`WithSubscriber::with_subscriber`], and
-//! set it as the default on threads that drop spans handed to them.
-//! `with_subscriber` sets the default only while the future is polled, so a future dropped before
-//! it completes drops its spans outside it.
+//! [`WithSubscriber::with_subscriber`] sets the default only while it polls the future, not while
+//! the future is dropped.
+//! A span that the future still holds then, such as the span that [`Instrument::instrument`]
+//! attaches, closes outside the default even after the future completes, and a cancelled future
+//! closes all of its spans there.
+//! For futures that run on other threads, use the global default, or a wrapper or executor that
+//! sets the default both while it polls a future and while it drops it.
+//! Set the default as well on threads that drop spans handed to them.
 //!
 //! [`SubscriberInitExt::init`]: tracing_subscriber::util::SubscriberInitExt::init
 //! [`WithSubscriber::with_subscriber`]: tracing::instrument::WithSubscriber::with_subscriber
+//! [`Instrument::instrument`]: tracing::instrument::Instrument::instrument
 //! [tokio-rs/tracing#2870]: https://github.com/tokio-rs/tracing/issues/2870
 //!
 //! # Limitations
