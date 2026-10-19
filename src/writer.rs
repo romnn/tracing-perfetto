@@ -12,12 +12,28 @@ use tracing_subscriber::fmt::MakeWriter;
 /// sampler thread, so a sink shared across threads must apply each buffer as a whole.
 ///
 /// Every [`MakeWriter`] is a `PerfettoWriter` that writes each buffer with one
-/// [`write_all`](std::io::Write::write_all) call on a fresh writer.
+/// [`write_all`](std::io::Write::write_all) call on a fresh writer, such as a
+/// `Mutex<File>`.
+///
+/// The layer writes each message as it happens and never flushes, so a trace cut short holds
+/// everything written so far.
+/// A buffering sink, such as a [`BufWriter`](std::io::BufWriter), holds the end of the trace
+/// until something else flushes it ([#5]).
+/// `tracing_appender::non_blocking` drops messages when its queue is full unless it is built with
+/// `lossy(false)`, and its `WorkerGuard` must outlive the trace, because dropping the guard
+/// flushes the queue.
+///
+/// A sink must not record spans or events, because it runs inside the layer's callbacks, which
+/// a span or event it records would reenter.
+///
+/// [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 pub trait PerfettoWriter {
     /// Writes one encoded perfetto `Trace` message.
     ///
-    /// The layer ignores the result, so a failed write loses that message and later writes
-    /// continue.
+    /// The layer ignores the result, and a failed or partial write can leave the rest of the
+    /// trace unreadable ([#4]).
+    ///
+    /// [#4]: https://github.com/romnn/tracing-perfetto/issues/4
     ///
     /// # Errors
     ///

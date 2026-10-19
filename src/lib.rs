@@ -37,6 +37,9 @@
 //! - `perfetto.slice_name` overrides the slice name, which otherwise falls back to `otel.name` and
 //!   then to the span's name.
 //!
+//! Give these fields, `otel.name` included, a string or a `%`-formatted value.
+//! A `?`-formatted value names the track or slice after its `Debug` rendering without the
+//! surrounding quotes, so the escapes inside a string remain.
 //! Recording either field later leaves the slice where it is.
 //!
 //! [`PerfettoLayer::with_thread_slices`] turns entered slices off.
@@ -81,6 +84,20 @@
 //! resident set size.
 //! A [`FinishHandle`] ends the trace while the layer is still installed, for example in a global
 //! dispatcher that is never dropped.
+//!
+//! # Limitations
+//!
+//! - A failed or partial write can leave the rest of the trace unreadable, and nothing reports
+//!   it ([#4]).
+//! - Finishing stops new writes, but a write already under way can still land after
+//!   [`FinishHandle::finish`] returns, and the writer is not flushed ([#5]).
+//! - Spans must close under the dispatcher the layer is installed in: when a child span closes
+//!   on a thread whose default dispatcher is another one, its parent's lifetime slice never ends
+//!   ([#9]).
+//!
+//! [#4]: https://github.com/romnn/tracing-perfetto/issues/4
+//! [#5]: https://github.com/romnn/tracing-perfetto/issues/5
+//! [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 //!
 //! # Examples
 //!

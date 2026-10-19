@@ -139,8 +139,9 @@ fn duration_nanos(duration: Duration) -> u64 {
 
 /// Encodes `trace` and hands it to `writer` as one buffer.
 ///
-/// A failed write loses only this message, so the error is dropped rather than stopping the
-/// layer.
+/// The error is dropped, although a failed or partial write can leave the rest of the trace
+/// unreadable.
+// TODO(#4): Stop writing after a failed write and report the error.
 fn write_encoded<W: PerfettoWriter + ?Sized>(writer: &W, trace: &idl::Trace) {
     let mut buf = BytesMut::new();
     let Ok(()) = trace.encode(&mut buf) else {

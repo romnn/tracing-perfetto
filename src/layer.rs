@@ -34,7 +34,8 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 /// Timestamps come from a monotonic clock that the trace maps onto wall-clock time.
 /// Several layers can share one registry, and each writes a trace that opens on its own.
 ///
-/// Dropping the layer, or finishing it through a [`FinishHandle`], ends the trace.
+/// Dropping the layer, or finishing it through a [`FinishHandle`], ends the trace, with the
+/// [limitations](crate#limitations) that the crate documents.
 pub struct PerfettoLayer<W> {
     layer_id: LayerId,
     sequence: Arc<TraceSequence>,
@@ -89,7 +90,8 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
 
     /// Configures whether spans and events carry their fields as debug annotations.
     ///
-    /// Disabled by default.
+    /// Disabled by default, because formatting every field costs time on every span and event,
+    /// and the fields recorded on a span stay in memory until it closes.
     /// When enabled, an event's fields are annotations on its instant.
     /// A span's creation fields are annotations on its lifetime slice's begin, and fields
     /// recorded later are annotations on its end.
@@ -153,7 +155,10 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     ///
     /// Intervals in which `source` reports no value are skipped, and an `interval` shorter than
     /// one millisecond samples every millisecond.
-    /// Calling this again stops and joins the previous sampler before the new one takes over.
+    /// Calling this again stops and joins the previous sampler, although only after the new one
+    /// has started ([#7]).
+    ///
+    /// [#7]: https://github.com/romnn/tracing-perfetto/issues/7
     #[must_use]
     pub fn with_process_memory_source(
         self,

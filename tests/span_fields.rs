@@ -122,3 +122,25 @@ fn field_filter_selects_spans_that_declare_the_field_without_a_value() -> Result
     );
     Ok(())
 }
+
+/// A `%`-formatted slice name is used as displayed, and a `?`-formatted one as its `Debug`
+/// rendering without the surrounding quotes.
+///
+/// Tracks merge by name, so a change to either rendering would silently rename the tracks and
+/// slices of every span that names them this way.
+#[gtest]
+fn formatted_slice_names_keep_their_rendering() -> Result<()> {
+    let writer = TestWriter::default();
+    let output = writer.clone();
+    let perfetto_layer = PerfettoLayer::new(writer).with_thread_slices(false);
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(perfetto_layer));
+
+    let name = r#"say "hi""#;
+    trace_span!("displayed", { "perfetto.slice_name" } = %name).in_scope(|| {});
+    trace_span!("debugged", { "perfetto.slice_name" } = ?name).in_scope(|| {});
+
+    let names = decode_track_event_names(&output.buf.lock()).or_fail()?;
+    expect_eq!(names, [r#"say "hi""#, r#"say \"hi\""#]);
+    Ok(())
+}

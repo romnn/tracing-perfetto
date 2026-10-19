@@ -68,8 +68,12 @@ impl std::fmt::Debug for FinishHandle {
 impl FinishHandle {
     /// Stops the layer from writing and joins its process-memory sampler.
     ///
-    /// Spans and events recorded afterwards are discarded, so the trace stays complete as written.
+    /// Spans and events recorded afterwards are discarded.
+    /// A write already under way can still land after this returns, and the writer is not
+    /// flushed ([#5]).
     /// Finishing again has no further effect.
+    ///
+    /// [#5]: https://github.com/romnn/tracing-perfetto/issues/5
     pub fn finish(&self) {
         self.lifecycle.finish();
     }

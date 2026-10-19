@@ -23,10 +23,14 @@ impl std::error::Error for DecodeError {
     }
 }
 
-/// Decodes a perfetto trace buffer and returns the names of all contained track events.
+/// Decodes a perfetto trace buffer and returns the literal names of its track events.
 ///
-/// The names are in packet order.
-/// Events without a name, such as slice ends and counter samples, are skipped.
+/// The names are in packet order, one per slice begin or instant, so a span appears once for
+/// its lifetime slice, once per entry, and once per resumption after an out-of-order exit.
+/// Events without a literal name are skipped: slice ends, counter samples, and events named
+/// through an interned `name_iid`, which this crate never writes.
+/// Decoding checks only that the buffer is a `Trace` protobuf, not that its tracks and slices
+/// are consistent.
 ///
 /// # Errors
 ///
