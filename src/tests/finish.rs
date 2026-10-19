@@ -3,7 +3,7 @@
 
 use crate::process_memory::ProcessMemorySource;
 use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
-use crate::tests::{ReplayedSlice, events_of_type, replay_lifetime_slices};
+use crate::tests::{ReplayedSlice, events_of_type, replay_lifetime_slices, wait_until};
 use crate::{FinishHandle, PerfettoLayer, idl};
 use googletest::prelude::*;
 use parking_lot::Mutex;
@@ -306,6 +306,7 @@ fn finish_waits_for_a_write_in_progress_and_nothing_follows() -> Result<()> {
         state: Arc::clone(&state),
     });
     let finish = layer.finish_handle();
+    let observer = layer.finish_handle();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
 
     // Another thread closes a span, and the writer holds the end of its slice.
@@ -329,9 +330,12 @@ fn finish_waits_for_a_write_in_progress_and_nothing_follows() -> Result<()> {
         }
     });
 
-    // The finish does not return while the write is held.
-    // The wait gives the finish time to begin, and passes only by timing out.
-    let early_return = returns.recv_timeout(Duration::from_millis(200));
+    // The finish waits for the held write before the test releases it, and has not returned.
+    if !wait_until(FINISH_BOUND, || observer.sink_closes_began() == 1) {
+        std::mem::forget(dispatch);
+        return fail!("the finish never began to wait for the write in progress");
+    }
+    let early_return = returns.try_recv();
     expect_that!(
         early_return.is_ok(),
         eq(false),

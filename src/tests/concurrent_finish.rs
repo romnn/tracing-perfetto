@@ -3,13 +3,12 @@
 
 use crate::process_memory::ProcessMemorySource;
 use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
-use crate::sink::TraceSink;
-use crate::tests::{TestWriter, decode, events_of_type};
+use crate::tests::{TestWriter, decode, events_of_type, wait_until};
 use crate::{FinishHandle, PerfettoLayer, idl};
 use googletest::prelude::*;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -39,6 +38,7 @@ enum SourceFinish {
 ///
 /// The sampler writes a sample before it reads the next one, so the pause proves that the first
 /// sample reached the writer.
+/// The sampler thread drops its source when it exits, which sets `sampler_exited`.
 struct PausingProcessMemory {
     samples: AtomicUsize,
     paused: mpsc::Sender<()>,
@@ -50,6 +50,13 @@ struct PausingProcessMemory {
     output: TestWriter,
     /// Sends what the source observed when its own finish returned.
     finished: mpsc::Sender<SourceFinishReturn>,
+    sampler_exited: Arc<AtomicBool>,
+}
+
+impl Drop for PausingProcessMemory {
+    fn drop(&mut self) {
+        self.sampler_exited.store(true, Ordering::Release);
+    }
 }
 
 /// What a [`PausingProcessMemory`] observed right after its own finish returned.
@@ -111,6 +118,9 @@ struct PausingLayer {
     release: mpsc::Sender<()>,
     /// Receives what the source observed when its own finish returned.
     source_finished: mpsc::Receiver<SourceFinishReturn>,
+    /// Whether the sampler thread has exited, after which it writes nothing and has released
+    /// the layer's sink.
+    sampler_exited: Arc<AtomicBool>,
 }
 
 /// Returns a layer that samples a [`PausingProcessMemory`] every millisecond, which finishes the
@@ -122,6 +132,7 @@ fn pausing_layer(source_finish: SourceFinish) -> Result<PausingLayer> {
     let (release, release_receiver) = mpsc::channel();
     let (finished_sender, source_finished) = mpsc::channel();
     let finish = Arc::new(OnceLock::new());
+    let sampler_exited = Arc::new(AtomicBool::new(false));
     let source = PausingProcessMemory {
         samples: AtomicUsize::new(0),
         paused: paused_sender,
@@ -130,6 +141,7 @@ fn pausing_layer(source_finish: SourceFinish) -> Result<PausingLayer> {
         finish: Arc::clone(&finish),
         output: output.make_writer(),
         finished: finished_sender,
+        sampler_exited: Arc::clone(&sampler_exited),
     };
     let layer = PerfettoLayer::new(writer)
         .with_process_memory_source(MIN_SAMPLING_INTERVAL, Box::new(source));
@@ -141,6 +153,7 @@ fn pausing_layer(source_finish: SourceFinish) -> Result<PausingLayer> {
         paused,
         release,
         source_finished,
+        sampler_exited,
     })
 }
 
@@ -148,23 +161,21 @@ fn pausing_layer(source_finish: SourceFinish) -> Result<PausingLayer> {
 struct FinishReturn {
     /// The length of the output.
     written: usize,
-    /// The strong references to the layer's sink, one of which a running sampler holds.
-    sink_references: usize,
+    /// Whether the sampler thread had exited.
+    sampler_exited: bool,
     result: std::io::Result<()>,
 }
 
-/// Finishes the trace through `finish` on a new thread, and sends what it observed on return.
-fn finish_on_thread(
-    finish: FinishHandle,
-    layer_sink: Weak<TraceSink<TestWriter>>,
-    output: TestWriter,
-    returned: mpsc::Sender<FinishReturn>,
-) {
+/// Finishes the trace of `pausing` on a new thread, and sends what it observed on return.
+fn finish_on_thread(pausing: &PausingLayer, returned: mpsc::Sender<FinishReturn>) {
+    let finish = pausing.layer.finish_handle();
+    let output = pausing.output.make_writer();
+    let sampler_exited = Arc::clone(&pausing.sampler_exited);
     std::thread::spawn(move || {
         let result = finish.finish();
         let finish_return = FinishReturn {
             written: output.buf.lock().len(),
-            sink_references: layer_sink.strong_count(),
+            sampler_exited: sampler_exited.load(Ordering::Acquire),
             result,
         };
         returned.send(finish_return).ok();
@@ -194,12 +205,7 @@ fn finish_from_the_sampler_thread_during_another_finish_returns() -> Result<()> 
     // Finish while the sampler is paused in its second sample, which then finishes too.
     pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
     let (returned, returns) = mpsc::channel();
-    finish_on_thread(
-        pausing.layer.finish_handle(),
-        Arc::downgrade(&layer_sink),
-        pausing.output.make_writer(),
-        returned,
-    );
+    finish_on_thread(&pausing, returned);
     pausing.release.send(()).or_fail()?;
 
     let Ok(test_finish) = returns.recv_timeout(FINISH_BOUND) else {
@@ -211,13 +217,15 @@ fn finish_from_the_sampler_thread_during_another_finish_returns() -> Result<()> 
         std::mem::forget(pausing.layer);
         return fail!("the sampler's own finish deadlocked or panicked");
     };
+    // The sampler released its sink, and no finish holds it any more.
+    expect_eq!(Arc::strong_count(&layer_sink), 2);
     drop(pausing.layer);
 
     // Both finishes found every write succeeded.
     expect_that!(test_finish.result, ok(anything()));
     expect_that!(source_return.result, ok(anything()));
-    // The test's finish returned only after the sampler had stopped and released its sink.
-    expect_eq!(test_finish.sink_references, 2);
+    // The test's finish returned only after the sampler had exited.
+    expect_that!(test_finish.sampler_exited, eq(true));
     // Nothing reached the writer after either finish returned.
     let written = pausing.output.buf.lock().len();
     expect_eq!(test_finish.written, written);
@@ -247,23 +255,20 @@ fn finish_from_the_sampler_thread_does_not_join_itself() -> Result<()> {
         return fail!("the sampler's own finish deadlocked or panicked");
     };
     let (returned, returns) = mpsc::channel();
-    finish_on_thread(
-        pausing.layer.finish_handle(),
-        Arc::downgrade(&layer_sink),
-        pausing.output.make_writer(),
-        returned,
-    );
+    finish_on_thread(&pausing, returned);
     let Ok(test_finish) = returns.recv_timeout(FINISH_BOUND) else {
         std::mem::forget(pausing.layer);
         return fail!("the finish after the sampler's own finish deadlocked");
     };
+    // The sampler released its sink, and no finish holds it any more.
+    expect_eq!(Arc::strong_count(&layer_sink), 2);
     drop(pausing.layer);
 
     // Both finishes found every write succeeded.
     expect_that!(test_finish.result, ok(anything()));
     expect_that!(source_return.result, ok(anything()));
-    // The later finish returned only after the sampler had stopped and released its sink.
-    expect_eq!(test_finish.sink_references, 2);
+    // The later finish returned only after the sampler had exited.
+    expect_that!(test_finish.sampler_exited, eq(true));
     // Nothing reached the writer after the sampler's own finish returned.
     expect_eq!(pausing.output.buf.lock().len(), source_return.written);
     // The sample read while the trace finished is discarded.
@@ -286,20 +291,18 @@ fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
     pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
     let (returned, returns) = mpsc::channel();
     for _ in 0..2 {
-        finish_on_thread(
-            pausing.layer.finish_handle(),
-            Arc::downgrade(&layer_sink),
-            pausing.output.make_writer(),
-            returned.clone(),
-        );
+        finish_on_thread(&pausing, returned.clone());
     }
 
-    // Neither finish returns while the sampler is paused.
-    // The wait gives both finishes time to begin, and passes only by timing out.
-    let mut finish_returns: Vec<FinishReturn> = returns
-        .recv_timeout(Duration::from_millis(200))
-        .into_iter()
-        .collect();
+    // Both finishes wait for the sampler before the test releases it, one joining it and the
+    // other waiting for that join, and neither has returned.
+    let observer = pausing.layer.finish_handle();
+    let both_wait = || observer.sampler_waits_began() == 2 && observer.sampler_join_began();
+    if !wait_until(FINISH_BOUND, both_wait) {
+        std::mem::forget(pausing.layer);
+        return fail!("the finishes never began to wait for the sampler");
+    }
+    let mut finish_returns: Vec<FinishReturn> = returns.try_iter().collect();
     expect_that!(
         finish_returns.len(),
         eq(0),
@@ -315,13 +318,15 @@ fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
         };
         finish_returns.push(finish_return);
     }
+    // The sampler released its sink, and no finish holds it any more.
+    expect_eq!(Arc::strong_count(&layer_sink), 2);
     drop(pausing.layer);
 
-    // Each finish returned after the sampler had released its sink and written its last sample.
+    // Each finish returned after the sampler had exited and written its last sample.
     let written = pausing.output.buf.lock().len();
     for finish_return in finish_returns {
         expect_that!(finish_return.result, ok(anything()));
-        expect_eq!(finish_return.sink_references, 2);
+        expect_that!(finish_return.sampler_exited, eq(true));
         expect_eq!(finish_return.written, written);
     }
     Ok(())

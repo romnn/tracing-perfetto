@@ -2,6 +2,8 @@
 
 use crate::process_memory::sampler::ProcessMemorySampler;
 use crate::sink::{CloseSink, WriteGate};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// The end of a layer's trace: the sampler that must stop, and the sink that must close.
@@ -26,6 +28,21 @@ pub(crate) struct TraceLifecycle {
     /// The gate of the layer's sink, which outlives the sink to hold the first error for
     /// [`FinishHandle`].
     write_gate: Arc<WriteGate>,
+    /// The finishes that began to wait, which tests observe to release what those finishes wait
+    /// for only once they wait.
+    #[cfg(test)]
+    waits_began: FinishWaits,
+}
+
+/// How many finishes began each wait of [`TraceLifecycle::finish`].
+#[cfg(test)]
+#[derive(Default)]
+struct FinishWaits {
+    /// The finishes that began to wait for the sampler, either to join it or for another
+    /// finish's join.
+    sampler: AtomicUsize,
+    /// The finishes that began to close the sink, which waits for the write in progress.
+    sink: AtomicUsize,
 }
 
 impl TraceLifecycle {
@@ -37,6 +54,8 @@ impl TraceLifecycle {
             sampler_join: parking_lot::Mutex::default(),
             sink,
             write_gate,
+            #[cfg(test)]
+            waits_began: FinishWaits::default(),
         }
     }
 
@@ -67,6 +86,8 @@ impl TraceLifecycle {
             return false;
         }
         if let Some(sink) = self.sink.upgrade() {
+            #[cfg(test)]
+            self.waits_began.sink.fetch_add(1, Ordering::Relaxed);
             sink.close();
         }
         true
@@ -88,6 +109,8 @@ impl TraceLifecycle {
         }
 
         // Any other thread
+        #[cfg(test)]
+        self.waits_began.sampler.fetch_add(1, Ordering::Relaxed);
         let _sampler_join = self.sampler_join.lock();
         let stopping = self
             .process_memory_sampler
@@ -188,5 +211,19 @@ impl FinishHandle {
             .lock()
             .as_ref()
             .is_some_and(ProcessMemorySampler::is_handed_out)
+    }
+
+    /// Returns how many finishes began to wait for the sampler, which they do on any thread but
+    /// the sampler thread and outside the writer.
+    #[cfg(test)]
+    pub(crate) fn sampler_waits_began(&self) -> usize {
+        self.lifecycle.waits_began.sampler.load(Ordering::Relaxed)
+    }
+
+    /// Returns how many finishes began to close the sink, after which each waits for the write
+    /// in progress.
+    #[cfg(test)]
+    pub(crate) fn sink_closes_began(&self) -> usize {
+        self.lifecycle.waits_began.sink.load(Ordering::Relaxed)
     }
 }

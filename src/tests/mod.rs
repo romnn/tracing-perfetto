@@ -76,6 +76,21 @@ fn annotated_layer() -> (crate::PerfettoLayer<TestWriter>, TestWriter) {
     )
 }
 
+/// Waits until `condition` holds, and returns whether it held within `bound`.
+///
+/// The bound only detects a condition that never holds, which fails the test instead of hanging
+/// it.
+fn wait_until(bound: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    while !condition() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+    true
+}
+
 /// Decodes everything written to `writer` so far as one trace.
 fn decode(writer: &TestWriter) -> Result<idl::Trace> {
     idl::Trace::decode(writer.buf.lock().as_slice()).or_fail()
