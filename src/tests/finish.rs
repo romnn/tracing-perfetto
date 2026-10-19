@@ -192,6 +192,14 @@ impl std::io::Write for FailingFlushWriter {
     }
 }
 
+/// The results of the two finishes that follow the failed write in
+/// [`a_finish_inside_a_failing_flush_reports_only_the_first_failure`].
+struct OuterFinishes {
+    /// The finish that flushes, from inside which the writer finishes again.
+    flushing: std::io::Result<()>,
+    later: std::io::Result<()>,
+}
+
 /// A writer that finishes the trace from inside the flush that follows a failed write, and whose
 /// flush then fails too, gets only the write's error reported, once across all finishes.
 ///
@@ -211,14 +219,30 @@ fn a_finish_inside_a_failing_flush_reports_only_the_first_failure() -> Result<()
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
 
     // The event's write fails, then the finish flushes, and the flush finishes the trace too.
-    tracing::dispatcher::with_default(&dispatch, || info!("lost"));
-    let outer_finish = finish.finish();
-    let later_finish = finish.finish();
+    // A thread of its own runs them, so a finish that waits for its own flush fails the bound
+    // instead of hanging the test.
+    let (returned, finishes_returned) = mpsc::channel();
+    std::thread::spawn({
+        let dispatch = dispatch.clone();
+        move || {
+            tracing::dispatcher::with_default(&dispatch, || info!("lost"));
+            let outer_finishes = OuterFinishes {
+                flushing: finish.finish(),
+                later: finish.finish(),
+            };
+            returned.send(outer_finishes).ok();
+        }
+    });
+    let Ok(OuterFinishes { flushing, later }) = finishes_returned.recv_timeout(FINISH_BOUND) else {
+        // Dropping the layer would finish it too, which waits for the stuck finish.
+        std::mem::forget(dispatch);
+        return fail!("a finish waited for the flush that called it");
+    };
     let nested_finish = state.nested_finish.lock().take().or_fail()?;
     drop(dispatch);
 
     // The write's error is reported once, and the flush's error never.
-    let reported: Vec<String> = [nested_finish, outer_finish, later_finish]
+    let reported: Vec<String> = [nested_finish, flushing, later]
         .into_iter()
         .filter_map(|result| result.err().map(|err| err.to_string()))
         .collect();
