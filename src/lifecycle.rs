@@ -57,14 +57,19 @@ impl TraceLifecycle {
     /// Inside a call to the writer, on any thread, this neither waits for the sampler, which may
     /// wait for that call, nor for the sink, whose lock that call holds: it requests both to
     /// stop, and the sink closes and flushes when that call returns.
-    pub(crate) fn finish(&self) {
-        let inside_writer = self.write_gate.is_writing_on_current_thread();
+    ///
+    /// Returns whether the trace has ended, which it has unless this was called inside a call to
+    /// the writer.
+    pub(crate) fn finish(&self) -> bool {
+        let inside_writer = self.write_gate.request_close_from_writer();
         self.stop_sampler(inside_writer);
         if inside_writer {
-            self.write_gate.request_close();
-        } else if let Some(sink) = self.sink.upgrade() {
+            return false;
+        }
+        if let Some(sink) = self.sink.upgrade() {
             sink.close();
         }
+        true
     }
 
     /// Stops the sampler, and waits for it unless the calling thread is the sampler thread or
@@ -159,8 +164,13 @@ impl FinishHandle {
     /// writer took.
     /// A failed flush is reported the same way, unless a write failed before.
     /// Only the first call after the failure returns the error, and later calls return `Ok`.
+    /// A call from inside the writer returns `Ok` and leaves the error to a later call.
     pub fn finish(&self) -> std::io::Result<()> {
-        self.lifecycle.finish();
+        // Inside the writer, the error is left to a later finish, since taking it would wait for
+        // the write that called this, and that write may still fail its flush.
+        if !self.lifecycle.finish() {
+            return Ok(());
+        }
         self.lifecycle.write_gate.take_error().map_or(Ok(()), Err)
     }
 

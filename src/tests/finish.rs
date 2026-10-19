@@ -150,6 +150,81 @@ fn finish_returns_the_flush_error() {
     drop(dispatch);
 }
 
+/// The message of the error that a [`FailingFlushWriter`] returns from every write.
+const WRITE_ERROR: &str = "injected write failure";
+
+/// The shared state of a [`FailingFlushWriter`]: the finish it performs from inside its flush,
+/// and what that finish returned.
+struct FailingFlushState {
+    /// The handle of the trace that the writer writes, set once the layer is built.
+    finish: OnceLock<FinishHandle>,
+    /// The result of the finish from inside the flush, once the flush ran.
+    nested_finish: Mutex<Option<std::io::Result<()>>>,
+}
+
+/// A writer whose writes fail with [`WRITE_ERROR`], and whose flush finishes the trace before
+/// it fails with [`FLUSH_ERROR`].
+struct FailingFlushWriter {
+    state: Arc<FailingFlushState>,
+}
+
+impl<'a> MakeWriter<'a> for FailingFlushWriter {
+    type Writer = FailingFlushWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FailingFlushWriter {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl std::io::Write for FailingFlushWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other(WRITE_ERROR))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(finish) = self.state.finish.get() {
+            let nested_finish = finish.finish();
+            *self.state.nested_finish.lock() = Some(nested_finish);
+        }
+        Err(std::io::Error::other(FLUSH_ERROR))
+    }
+}
+
+/// A writer that finishes the trace from inside the flush that follows a failed write, and whose
+/// flush then fails too, gets only the write's error reported, once across all finishes.
+///
+/// A finish from inside the flush that reported the write's error would leave no error behind,
+/// so the flush's error would count as the first failure and be reported a second time.
+#[gtest]
+fn a_finish_inside_a_failing_flush_reports_only_the_first_failure() -> Result<()> {
+    let state = Arc::new(FailingFlushState {
+        finish: OnceLock::new(),
+        nested_finish: Mutex::new(None),
+    });
+    let layer = PerfettoLayer::new(FailingFlushWriter {
+        state: Arc::clone(&state),
+    });
+    state.finish.set(layer.finish_handle()).or_fail()?;
+    let finish = layer.finish_handle();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+
+    // The event's write fails, then the finish flushes, and the flush finishes the trace too.
+    tracing::dispatcher::with_default(&dispatch, || info!("lost"));
+    let outer_finish = finish.finish();
+    let later_finish = finish.finish();
+    let nested_finish = state.nested_finish.lock().take().or_fail()?;
+    drop(dispatch);
+
+    // The write's error is reported once, and the flush's error never.
+    let reported: Vec<String> = [nested_finish, outer_finish, later_finish]
+        .into_iter()
+        .filter_map(|result| result.err().map(|err| err.to_string()))
+        .collect();
+    verify_that!(reported, elements_are![eq(WRITE_ERROR)])
+}
+
 /// The output that [`HoldingWriter`] shares with the test, and the channels that hold its write.
 struct HoldingState {
     output: Mutex<Vec<u8>>,

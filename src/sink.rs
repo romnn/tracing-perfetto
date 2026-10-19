@@ -36,26 +36,23 @@ pub(crate) struct WriteGate {
     /// Once set, no write reaches the writer, and the thread that set it flushes the writer
     /// before it releases the lock.
     closed: AtomicBool,
-    /// The [`thread_id::get`] of the thread that holds the state lock to call the writer, while
-    /// one does.
+    /// The call to the writer that a thread makes while it holds the state lock, while one does.
     ///
     /// It lets a finish from inside the writer see that it cannot take the lock that its own
-    /// write holds.
+    /// write holds, and leave closing the gate to that write.
+    /// Its lock is never held across anything else.
+    writer_call: parking_lot::Mutex<Option<WriterCall>>,
+}
+
+/// A call to the writer, made by a thread that holds the state lock.
+struct WriterCall {
+    /// The [`thread_id::get`] of the calling thread.
+    ///
     /// [`thread_id::get`] reads no thread-local value, so it works while a thread's thread-local
     /// values are destroyed, when the layer still writes, and [`std::thread::current`] panics.
-    /// Its lock is never held across anything else.
-    writer_thread: parking_lot::Mutex<Option<usize>>,
-    /// Set by a finish from inside the writer, which leaves closing the gate to the write that
-    /// called it.
-    close_requested: AtomicBool,
-    /// The first error of a write or of the flush, until a [`FinishHandle`] reports it.
-    ///
-    /// It has a lock of its own, which is never held across a call to the writer, so a writer
-    /// that finishes the trace from inside its own write does not wait for the state lock that
-    /// write holds.
-    ///
-    /// [`FinishHandle`]: crate::FinishHandle
-    error: parking_lot::Mutex<Option<std::io::Error>>,
+    thread: usize,
+    /// Whether a finish from inside the call asked to close the gate once the call returns.
+    close_requested: bool,
 }
 
 enum GateState {
@@ -63,16 +60,26 @@ enum GateState {
     Pending,
     /// The preamble is written, and every write so far succeeded.
     Open,
-    /// A write failed, so no more writes reach the writer.
-    Failed,
+    /// A write or the flush failed, so no more writes reach the writer.
+    ///
+    /// It holds the error until a [`FinishHandle`] reports it.
+    /// A gate fails only once, so a later failure of the flush is neither kept nor reported,
+    /// also after the first error was reported.
+    ///
+    /// [`FinishHandle`]: crate::FinishHandle
+    Failed(Option<std::io::Error>),
 }
 
 impl WriteGate {
     /// Returns the error of the write or flush that failed first, unless it was taken already.
     ///
-    /// The error of a write still in progress is not reported yet.
+    /// Waits for the write in progress, so the calling thread must not be inside a call to the
+    /// writer.
     pub(crate) fn take_error(&self) -> Option<std::io::Error> {
-        self.error.lock().take()
+        match &mut *self.state.lock() {
+            GateState::Failed(error) => error.take(),
+            GateState::Pending | GateState::Open => None,
+        }
     }
 
     /// Returns whether the gate is closed, after which no write reaches the writer.
@@ -80,27 +87,20 @@ impl WriteGate {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Returns whether the calling thread is inside a call to the writer, holding the state lock.
+    /// Asks the call to the writer that the calling thread is inside, if it is inside one, to
+    /// close the gate once that call returns.
     ///
+    /// Returns whether the calling thread is inside a call to the writer, holding the state lock.
     /// A finish there cannot take the lock, nor wait for anything that waits for it, such as
     /// the sampler's next write.
-    pub(crate) fn is_writing_on_current_thread(&self) -> bool {
-        *self.writer_thread.lock() == Some(thread_id::get())
-    }
-
-    /// Closes the gate once the write that the calling thread is inside returns.
-    ///
-    /// Only the thread inside the write calls this, so that write sees the request before it
-    /// releases the lock.
-    pub(crate) fn request_close(&self) {
-        self.close_requested.store(true, Ordering::Relaxed);
-    }
-
-    /// Keeps `err` unless an earlier failure is still unreported.
-    fn latch_error(&self, err: std::io::Error) {
-        let mut error = self.error.lock();
-        if error.is_none() {
-            *error = Some(err);
+    pub(crate) fn request_close_from_writer(&self) -> bool {
+        let mut writer_call = self.writer_call.lock();
+        match writer_call.as_mut() {
+            Some(call) if call.thread == thread_id::get() => {
+                call.close_requested = true;
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -114,14 +114,26 @@ struct CallingWriter<'gate> {
 
 impl<'gate> CallingWriter<'gate> {
     fn enter(gate: &'gate WriteGate) -> Self {
-        *gate.writer_thread.lock() = Some(thread_id::get());
+        *gate.writer_call.lock() = Some(WriterCall {
+            thread: thread_id::get(),
+            close_requested: false,
+        });
         Self { gate }
+    }
+
+    /// Returns whether a finish from inside this call asked to close the gate.
+    fn close_requested(&self) -> bool {
+        self.gate
+            .writer_call
+            .lock()
+            .as_ref()
+            .is_some_and(|call| call.close_requested)
     }
 }
 
 impl Drop for CallingWriter<'_> {
     fn drop(&mut self) {
-        *self.gate.writer_thread.lock() = None;
+        *self.gate.writer_call.lock() = None;
     }
 }
 
@@ -134,9 +146,7 @@ impl<W> TraceSink<W> {
             gate: Arc::new(WriteGate {
                 state: parking_lot::Mutex::new(GateState::Pending),
                 closed: AtomicBool::new(false),
-                writer_thread: parking_lot::Mutex::default(),
-                close_requested: AtomicBool::new(false),
-                error: parking_lot::Mutex::default(),
+                writer_call: parking_lot::Mutex::default(),
             }),
         }
     }
@@ -170,8 +180,8 @@ impl<W: PerfettoWriter> TraceSink<W> {
         let calling_writer = CallingWriter::enter(&self.gate);
         let written = self.write_locked(&mut state, message);
         // A finish from inside the writer could not take the lock that this write holds.
-        if self.gate.close_requested.load(Ordering::Relaxed) {
-            self.close_locked();
+        if calling_writer.close_requested() {
+            self.close_locked(&mut state);
         }
         drop(calling_writer);
         written
@@ -184,7 +194,7 @@ impl<W: PerfettoWriter> TraceSink<W> {
             return false;
         }
         match *state {
-            GateState::Failed => return false,
+            GateState::Failed(_) => return false,
             GateState::Open => {}
             GateState::Pending => {
                 let Some(preamble) = encode(&self.sequence.preamble_trace()) else {
@@ -205,8 +215,7 @@ impl<W: PerfettoWriter> TraceSink<W> {
             Ok(()) => true,
             Err(err) => {
                 // Only the first failure gets here, since the gate stays failed after it.
-                *state = GateState::Failed;
-                self.gate.latch_error(err);
+                *state = GateState::Failed(Some(err));
                 false
             }
         }
@@ -218,12 +227,15 @@ impl<W: PerfettoWriter> TraceSink<W> {
     /// finish from inside the flush does not wait for that lock.
     /// The writer is flushed after a failed write too, which lets a buffering writer pass on the
     /// whole messages it took before the failure.
-    fn close_locked(&self) {
+    /// A failed flush fails the gate, unless a write failed before.
+    fn close_locked(&self, state: &mut GateState) {
         if self.gate.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Err(err) = self.writer.flush() {
-            self.gate.latch_error(err);
+        if let Err(err) = self.writer.flush()
+            && !matches!(state, GateState::Failed(_))
+        {
+            *state = GateState::Failed(Some(err));
         }
     }
 }
@@ -235,7 +247,7 @@ pub(crate) trait CloseSink: Send + Sync {
     ///
     /// Waits for the write in progress, which holds the state lock, so every write that took the
     /// lock before has reached the writer when this returns.
-    /// A flush error is kept like a write error, unless an earlier error is still unreported.
+    /// A flush error is kept like a write error, unless a write failed before.
     /// Closing again has no further effect.
     /// The calling thread must not be inside a call to the writer, since this waits for the lock
     /// that such a call holds.
@@ -244,9 +256,9 @@ pub(crate) trait CloseSink: Send + Sync {
 
 impl<W: PerfettoWriter + Send + Sync> CloseSink for TraceSink<W> {
     fn close(&self) {
-        let _state = self.gate.state.lock();
+        let mut state = self.gate.state.lock();
         let _calling_writer = CallingWriter::enter(&self.gate);
-        self.close_locked();
+        self.close_locked(&mut state);
     }
 }
 
