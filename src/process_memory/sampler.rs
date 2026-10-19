@@ -1,7 +1,7 @@
 //! The thread that samples a [`ProcessMemorySource`] onto a layer's `process.rss` counter track.
 
 use crate::process_memory::ProcessMemorySource;
-use crate::sequence::TraceSequence;
+use crate::sink::TraceSink;
 use crate::writer::PerfettoWriter;
 use crate::{idl, packets};
 use std::sync::Arc;
@@ -15,9 +15,8 @@ pub(crate) const MIN_SAMPLING_INTERVAL: Duration = Duration::from_millis(1);
 
 /// What a [`ProcessMemorySampler`] samples and where it writes the samples.
 pub(crate) struct ProcessMemorySamplerConfig<W> {
-    pub(crate) writer: Arc<W>,
-    /// The layer's sequence, so the samples share its clock and preamble.
-    pub(crate) sequence: Arc<TraceSequence>,
+    /// The layer's sink, so the samples share its sequence, clock and preamble.
+    pub(crate) sink: Arc<TraceSink<W>>,
     pub(crate) counter_track_uuid: u64,
     /// The interval between samples, raised to at least [`MIN_SAMPLING_INTERVAL`].
     pub(crate) interval: Duration,
@@ -41,8 +40,9 @@ pub(crate) struct ProcessMemorySampler {
 impl ProcessMemorySampler {
     /// Spawns a thread that samples `config.source` every `config.interval`.
     ///
-    /// The counter track's descriptor is written with the first sample, and intervals without a
-    /// value are skipped.
+    /// The counter track's descriptor is written with the first sample, and the track counts as
+    /// described only once that write succeeds.
+    /// Intervals without a value are skipped.
     /// A sample read while a stop is requested is not written, even when the source itself
     /// requested it.
     /// If the thread cannot be spawned, nothing is sampled.
@@ -66,8 +66,7 @@ impl ProcessMemorySampler {
                         break;
                     }
                     if let Some(rss_bytes) = rss_bytes {
-                        write_sample(&config, rss_bytes, !wrote_descriptor);
-                        wrote_descriptor = true;
+                        wrote_descriptor |= write_sample(&config, rss_bytes, !wrote_descriptor);
                     }
                     match stopped.recv_timeout(interval) {
                         Err(RecvTimeoutError::Timeout) => {}
@@ -145,13 +144,14 @@ pub(crate) fn sampling_interval(requested: Duration) -> Duration {
 }
 
 /// Writes one counter sample of `rss_bytes`, preceded by the counter track's descriptor if
-/// `include_descriptor` is set.
+/// `include_descriptor` is set, and returns whether the sample was written.
 fn write_sample<W: PerfettoWriter>(
     config: &ProcessMemorySamplerConfig<W>,
     rss_bytes: u64,
     include_descriptor: bool,
-) {
-    let mut packet = config.sequence.timestamped_packet();
+) -> bool {
+    let sequence = config.sink.sequence();
+    let mut packet = sequence.timestamped_packet();
 
     let counter_value = i64::try_from(rss_bytes).unwrap_or(i64::MAX);
     let mut event = idl::TrackEvent {
@@ -170,7 +170,7 @@ fn write_sample<W: PerfettoWriter>(
         counter.set_unit(idl::counter_descriptor::Unit::SizeBytes);
         trace_packets.push(packets::track_descriptor_packet(idl::TrackDescriptor {
             uuid: Some(config.counter_track_uuid),
-            parent_uuid: Some(config.sequence.process_track_uuid()),
+            parent_uuid: Some(sequence.process_track_uuid()),
             static_or_dynamic_name: Some(packets::track_name("process.rss")),
             counter: Some(counter),
             ..Default::default()
@@ -178,10 +178,7 @@ fn write_sample<W: PerfettoWriter>(
     }
     trace_packets.push(packet);
 
-    config.sequence.write(
-        config.writer.as_ref(),
-        &idl::Trace {
-            packet: trace_packets,
-        },
-    );
+    config.sink.write(&idl::Trace {
+        packet: trace_packets,
+    })
 }

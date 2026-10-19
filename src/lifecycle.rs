@@ -1,13 +1,13 @@
 //! Ending a layer's trace, whether the layer is dropped or finished through a [`FinishHandle`].
 
 use crate::process_memory::sampler::ProcessMemorySampler;
+use crate::sink::WriteGate;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether a layer's trace has ended, and the sampler that must stop when it does.
 ///
 /// The layer and its [`FinishHandle`]s share this state.
-#[derive(Default)]
 pub(crate) struct TraceLifecycle {
     finished: AtomicBool,
     /// The sampler, which stays here after it is stopped so that its thread still recognizes
@@ -19,9 +19,22 @@ pub(crate) struct TraceLifecycle {
     /// The sampler thread never takes it, and the join happens outside the
     /// `process_memory_sampler` lock, which the sampler thread takes when it finishes the trace.
     sampler_join: parking_lot::Mutex<()>,
+    /// The gate of the layer's sink, which holds the first write error for [`FinishHandle`].
+    write_gate: Arc<WriteGate>,
 }
 
 impl TraceLifecycle {
+    /// Returns the lifecycle of a trace that is not finished, written through the sink that
+    /// `write_gate` belongs to.
+    pub(crate) fn new(write_gate: Arc<WriteGate>) -> Self {
+        Self {
+            finished: AtomicBool::new(false),
+            process_memory_sampler: parking_lot::Mutex::default(),
+            sampler_join: parking_lot::Mutex::default(),
+            write_gate,
+        }
+    }
+
     /// Returns a handle that finishes this trace.
     pub(crate) fn finish_handle(self: &Arc<Self>) -> FinishHandle {
         FinishHandle {
@@ -96,7 +109,8 @@ impl std::fmt::Debug for FinishHandle {
 }
 
 impl FinishHandle {
-    /// Stops the layer from writing and joins its process-memory sampler.
+    /// Stops the layer from writing, joins its process-memory sampler, and reports a failed
+    /// write.
     ///
     /// Spans and events recorded afterwards are discarded.
     /// Concurrent finishes each return only after the sampler has stopped.
@@ -106,10 +120,20 @@ impl FinishHandle {
     /// flushed ([#5]).
     /// Finishing again has no further effect.
     ///
+    /// Dropping the layer ends the trace too, but only this reports a write error.
+    ///
     /// [#5]: https://github.com/romnn/tracing-perfetto/issues/5
     /// [`ProcessMemorySource`]: crate::process_memory::ProcessMemorySource
-    pub fn finish(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of the writer, after which the layer wrote nothing more, so the
+    /// output is the trace up to the failed write, followed by whatever part of that write the
+    /// writer took.
+    /// Only the first call after the failure returns the error, and later calls return `Ok`.
+    pub fn finish(&self) -> std::io::Result<()> {
         self.lifecycle.finish();
+        self.lifecycle.write_gate.take_error().map_or(Ok(()), Err)
     }
 
     /// Returns whether a finish has taken the sampler thread to join it.

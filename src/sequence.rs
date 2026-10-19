@@ -1,10 +1,6 @@
 //! The trusted packet sequence a layer writes on, with its clock and preamble.
 
-use crate::writer::PerfettoWriter;
 use crate::{idl, packets};
-use bytes::BytesMut;
-use prost::Message;
-use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime};
 
 /// The clock that every timestamped packet of a layer refers to.
@@ -16,14 +12,13 @@ pub(crate) const SEQUENCE_CLOCK_ID: u32 = 64;
 /// The packet sequence shared by a layer and its process-memory sampler.
 ///
 /// Every packet that reads [`SEQUENCE_CLOCK_ID`] must follow the preamble that defines it, so
-/// [`TraceSequence::write`] is the only way packets reach the writer.
+/// packets reach the writer only through the [`TraceSink`](crate::sink::TraceSink) that writes
+/// the preamble first.
 pub(crate) struct TraceSequence {
     sequence_id: u32,
     process_track_uuid: u64,
     /// The zero point of [`SEQUENCE_CLOCK_ID`].
     epoch: Instant,
-    /// Completes once the preamble has been handed to the writer.
-    preamble: Once,
 }
 
 impl TraceSequence {
@@ -36,7 +31,6 @@ impl TraceSequence {
             sequence_id: rand::random_range(2..=u32::MAX),
             process_track_uuid: packets::unique_uuid(),
             epoch: Instant::now(),
-            preamble: Once::new(),
         }
     }
 
@@ -79,24 +73,12 @@ impl TraceSequence {
         }
     }
 
-    /// Writes `trace` to `writer`, preceded by this sequence's preamble on the first write.
-    ///
-    /// Concurrent first writes block until the preamble is written, so on a writer that applies
-    /// writes in call order no packet of this sequence precedes it.
-    pub(crate) fn write<W: PerfettoWriter + ?Sized>(&self, writer: &W, trace: &idl::Trace) {
-        // Forcing past a poisoned guard retries the preamble after a panicking writer, instead of
-        // panicking on every later write.
-        self.preamble
-            .call_once_force(|_| write_encoded(writer, &self.preamble_trace()));
-        write_encoded(writer, trace);
-    }
-
     /// Builds the process track descriptor and the clock snapshot that defines
     /// [`SEQUENCE_CLOCK_ID`].
     ///
     /// The snapshot pairs the sequence clock with the wall clock and makes the wall clock the trace
     /// clock, so trace processor keeps the monotonic ordering and displays wall-clock time.
-    fn preamble_trace(&self) -> idl::Trace {
+    pub(crate) fn preamble_trace(&self) -> idl::Trace {
         // Read both clocks back to back so that the snapshot pins their offset.
         let sequence_timestamp = self.now();
         let realtime_timestamp = SystemTime::now()
@@ -135,17 +117,4 @@ impl TraceSequence {
 /// Returns `duration` in nanoseconds, saturating at [`u64::MAX`] after about 584 years.
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Encodes `trace` and hands it to `writer` as one buffer.
-///
-/// The error is dropped, although a failed or partial write can leave the rest of the trace
-/// unreadable.
-// TODO(#4): Stop writing after a failed write and report the error.
-fn write_encoded<W: PerfettoWriter + ?Sized>(writer: &W, trace: &idl::Trace) {
-    let mut buf = BytesMut::new();
-    let Ok(()) = trace.encode(&mut buf) else {
-        return;
-    };
-    _ = writer.write_log(buf);
 }

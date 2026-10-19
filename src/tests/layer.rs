@@ -179,17 +179,17 @@ fn finish_handle_ends_the_trace_of_a_live_layer() {
         Box::new(FixedProcessMemory),
     );
     let finish = perfetto_layer.finish_handle();
-    let layer_writer = Arc::clone(perfetto_layer.writer());
+    let layer_sink = Arc::clone(perfetto_layer.sink());
     let subscriber = tracing_subscriber::registry().with(perfetto_layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
     trace_span!("before_finish").in_scope(|| {});
-    finish.finish();
+    expect_that!(finish.finish(), ok(anything()));
     let written = extra_writer.buf.lock().len();
     trace_span!("after_finish").in_scope(|| {});
 
-    // The joined sampler released its writer, leaving this test's and the layer's references.
-    expect_eq!(Arc::strong_count(&layer_writer), 2);
+    // The joined sampler released its sink, leaving this test's and the layer's references.
+    expect_eq!(Arc::strong_count(&layer_sink), 2);
     // The span recorded before finishing reached the writer; the later one did not.
     expect_that!(
         written,
@@ -214,7 +214,7 @@ fn cloned_finish_handle_finishes_the_same_trace() {
         tracing::subscriber::set_default(tracing_subscriber::registry().with(perfetto_layer));
 
     expect_eq!(format!("{finish:?}"), "FinishHandle { finished: false }");
-    cloned.finish();
+    expect_that!(cloned.finish(), ok(anything()));
     let written = output.buf.lock().len();
     trace_span!("after_finish").in_scope(|| {});
 
@@ -263,19 +263,16 @@ fn finish_stops_the_sampler_without_waiting_for_its_interval() -> Result<()> {
     announced.recv().or_fail()?;
     let (finished, finished_receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        finish.finish();
-        finished.send(()).ok();
+        finished.send(finish.finish()).ok();
     });
 
     // The bound is far above any scheduling delay and far below the interval.
-    let finished_in_time = finished_receiver
-        .recv_timeout(Duration::from_secs(30))
-        .is_ok();
-    if !finished_in_time {
+    let finished = finished_receiver.recv_timeout(Duration::from_secs(30));
+    if finished.is_err() {
         // Dropping the layer would finish it too, which waits for the stuck finish.
         std::mem::forget(layer);
     }
-    verify_true!(finished_in_time)
+    verify_that!(finished, ok(ok(anything())))
 }
 
 /// A zero sampling interval samples at most once per millisecond.
@@ -293,7 +290,7 @@ fn zero_interval_samples_at_most_once_per_millisecond() -> Result<()> {
     for _ in 0..4 {
         announced.recv().or_fail()?;
     }
-    finish.finish();
+    finish.finish().or_fail()?;
 
     // Consecutive samples lie at least the minimum interval apart.
     let trace = idl::Trace::decode(output.buf.lock().as_slice()).or_fail()?;

@@ -6,7 +6,7 @@ use crate::lifecycle::{FinishHandle, TraceLifecycle};
 use crate::packets::{self, SourceLocation, UnplacedEvent};
 use crate::process_memory::sampler::{ProcessMemorySampler, ProcessMemorySamplerConfig};
 use crate::process_memory::{self, ProcessMemorySource};
-use crate::sequence::TraceSequence;
+use crate::sink::TraceSink;
 use crate::span_state::{
     self, LayerId, LifetimeSlice, SpanKind, SpanPlacement, SpanState, SpanStates,
 };
@@ -38,8 +38,8 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 /// [limitations](crate#limitations) that the crate documents.
 pub struct PerfettoLayer<W> {
     layer_id: LayerId,
-    sequence: Arc<TraceSequence>,
-    writer: Arc<W>,
+    /// The sink that the layer and its process-memory sampler write through.
+    sink: Arc<TraceSink<W>>,
     config: Config,
     threads: ThreadStates,
     /// The counter track of the process-memory samples, which every sampler of the layer reuses.
@@ -72,14 +72,15 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     #[must_use]
     pub fn new(writer: W) -> Self {
         let layer_id = LayerId::next();
+        let sink = TraceSink::new(writer);
+        let lifecycle = Arc::new(TraceLifecycle::new(Arc::clone(sink.gate())));
         Self {
             layer_id,
-            sequence: Arc::new(TraceSequence::new()),
-            writer: Arc::new(writer),
+            sink: Arc::new(sink),
             config: Config::default(),
             threads: ThreadStates::new(layer_id),
             process_memory_rss_track_uuid: packets::unique_uuid(),
-            lifecycle: Arc::default(),
+            lifecycle,
         }
     }
 
@@ -170,8 +171,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         W: Send + Sync + 'static,
     {
         let sampler = ProcessMemorySampler::spawn(ProcessMemorySamplerConfig {
-            writer: Arc::clone(&self.writer),
-            sequence: Arc::clone(&self.sequence),
+            sink: Arc::clone(&self.sink),
             counter_track_uuid: self.process_memory_rss_track_uuid,
             interval,
             source,
@@ -180,20 +180,18 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         self
     }
 
-    /// Writes `trace_packets` as one `Trace` message, unless the trace is finished.
+    /// Writes `trace_packets` as one `Trace` message, unless the trace is finished, and returns
+    /// whether the message was written.
     ///
     /// Every packet of the layer reaches the writer through here or through the sampler, both of
-    /// which write through the [`TraceSequence`], so the sequence's preamble precedes them.
-    fn write_packets(&self, trace_packets: Vec<idl::TracePacket>) {
+    /// which write through the [`TraceSink`], so the sequence's preamble precedes them.
+    fn write_packets(&self, trace_packets: Vec<idl::TracePacket>) -> bool {
         if self.lifecycle.is_finished() {
-            return;
+            return false;
         }
-        self.sequence.write(
-            self.writer.as_ref(),
-            &idl::Trace {
-                packet: trace_packets,
-            },
-        );
+        self.sink.write(&idl::Trace {
+            packet: trace_packets,
+        })
     }
 
     /// Writes `events` on the calling thread's track, which is described on its first use.
@@ -211,22 +209,26 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
 
         // During thread teardown the layer keeps no record of the description, so every use
         // describes the track again and no packet refers to an undescribed track.
-        let first_use = self
+        let described = self
             .threads
-            .with_current(|thread| !std::mem::replace(&mut thread.track_described, true))
-            .unwrap_or(true);
-        if first_use {
+            .with_current(|thread| thread.track_described)
+            .unwrap_or(false);
+        if !described {
             trace_packets.push(packets::track_descriptor_packet(
                 thread_track::current_thread_track_descriptor(),
             ));
         }
-        let timestamp = self.sequence.now();
+        let timestamp = self.sink.sequence().now();
         trace_packets.extend(
             events
                 .into_iter()
                 .map(|event| self.event_packet(event.on_track(track_uuid), timestamp)),
         );
-        self.write_packets(trace_packets);
+        // The track counts as described only once its descriptor is written.
+        if self.write_packets(trace_packets) && !described {
+            self.threads
+                .with_current(|thread| thread.track_described = true);
+        }
     }
 
     /// Writes `event` on the span track `track_uuid`, timestamped now.
@@ -241,7 +243,8 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     ) {
         let mut trace_packets = Vec::with_capacity(2);
         trace_packets.extend(new_track.map(packets::track_descriptor_packet));
-        trace_packets.push(self.event_packet(event.on_track(track_uuid), self.sequence.now()));
+        trace_packets
+            .push(self.event_packet(event.on_track(track_uuid), self.sink.sequence().now()));
         self.write_packets(trace_packets);
     }
 
@@ -249,7 +252,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     fn event_packet(&self, event: idl::TrackEvent, timestamp: u64) -> idl::TracePacket {
         idl::TracePacket {
             data: Some(idl::trace_packet::Data::TrackEvent(event)),
-            ..self.sequence.packet_at(timestamp)
+            ..self.sink.sequence().packet_at(timestamp)
         }
     }
 
@@ -272,7 +275,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         } = span_state::place_span(
             span,
             self.layer_id,
-            self.sequence.process_track_uuid(),
+            self.sink.sequence().process_track_uuid(),
             own_track_name,
         );
         self.write_on_span_track(lifetime.track_uuid, new_track, begin);
@@ -284,12 +287,12 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
 impl<W> PerfettoLayer<W> {
     /// Returns the UUID of the process track that the layer's preamble describes.
     pub(crate) fn process_track_uuid(&self) -> u64 {
-        self.sequence.process_track_uuid()
+        self.sink.sequence().process_track_uuid()
     }
 
-    /// Returns the writer that the layer and its sampler share.
-    pub(crate) fn writer(&self) -> &Arc<W> {
-        &self.writer
+    /// Returns the sink that the layer and its sampler share.
+    pub(crate) fn sink(&self) -> &Arc<TraceSink<W>> {
+        &self.sink
     }
 }
 

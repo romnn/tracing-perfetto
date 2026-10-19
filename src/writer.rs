@@ -9,7 +9,11 @@ use tracing_subscriber::fmt::MakeWriter;
 /// Each call hands over one complete `Trace` message, and messages written back to back decode as
 /// one trace, so a sink that appends every buffer in call order produces a valid trace file.
 /// The layer writes from every thread that records spans or events, and from its process-memory
-/// sampler thread, so a sink shared across threads must apply each buffer as a whole.
+/// sampler thread, but hands over one message at a time.
+///
+/// After the first failed write the layer writes nothing more, so the output is the trace up to
+/// that write, followed by whatever part of the failed message the sink took.
+/// [`FinishHandle::finish`](crate::FinishHandle::finish) returns the error.
 ///
 /// Every [`MakeWriter`] is a `PerfettoWriter` that writes each buffer with one
 /// [`write_all`](std::io::Write::write_all) call on a fresh writer, such as a
@@ -25,21 +29,19 @@ use tracing_subscriber::fmt::MakeWriter;
 /// the guard flushes the queue, but it waits about a second at most, so a large backlog can still
 /// lose its tail.
 ///
-/// A sink must not record spans or events, because it runs inside the layer's callbacks, which
-/// a span or event it records would reenter.
+/// A sink must not record spans or events: the layer calls it while holding the lock that every
+/// write of the trace takes, so a span or event that the sink records deadlocks on that lock.
+/// Reentering the layer from inside its own write was never safe.
+/// A sink may finish the trace from the process-memory sampler thread, but a finish from any
+/// other thread can deadlock with a sampler that waits to write.
 ///
 /// [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 pub trait PerfettoWriter {
     /// Writes one encoded perfetto `Trace` message.
     ///
-    /// The layer ignores the result, and a failed or partial write can leave the rest of the
-    /// trace unreadable ([#4]).
-    ///
-    /// [#4]: https://github.com/romnn/tracing-perfetto/issues/4
-    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying writer fails.
+    /// Returns an error if the underlying writer fails, which ends the layer's trace.
     fn write_log(&self, buf: BytesMut) -> std::io::Result<()>;
 }
 
