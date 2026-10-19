@@ -331,9 +331,9 @@ fn finish_waits_for_a_write_in_progress_and_nothing_follows() -> Result<()> {
     });
 
     // The finish waits for the held write before the test releases it, and has not returned.
-    if !wait_until(FINISH_BOUND, || observer.sink_closes_began() == 1) {
+    if !wait_until(FINISH_BOUND, || observer.sink_close_contentions() == 1) {
         std::mem::forget(dispatch);
-        return fail!("the finish never began to wait for the write in progress");
+        return fail!("the finish never waited for the write in progress");
     }
     let early_return = returns.try_recv();
     expect_that!(

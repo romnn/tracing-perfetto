@@ -7,6 +7,8 @@ use crate::writer::PerfettoWriter;
 use bytes::BytesMut;
 use prost::Message;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The only path from a layer and its process-memory sampler to the writer.
@@ -42,6 +44,10 @@ pub(crate) struct WriteGate {
     /// write holds, and leave closing the gate to that write.
     /// Its lock is never held across anything else.
     writer_call: parking_lot::Mutex<Option<WriterCall>>,
+    /// The closes that found the state lock held, so tests release a held write only once a
+    /// finish waits for it.
+    #[cfg(test)]
+    close_contentions: AtomicUsize,
 }
 
 /// A call to the writer, made by a thread that holds the state lock.
@@ -103,6 +109,27 @@ impl WriteGate {
             _ => false,
         }
     }
+
+    /// Returns how many closes had to wait for the state lock.
+    #[cfg(test)]
+    pub(crate) fn close_contentions(&self) -> usize {
+        self.close_contentions.load(Ordering::Relaxed)
+    }
+}
+
+/// Locks `mutex`, and counts in `contentions` a lock that had to wait for another thread.
+///
+/// A test that observes the count knows that a thread waits for the lock, which it holds until
+/// it releases what the test blocked, so a thread that never waits leaves the count unchanged.
+#[cfg(test)]
+pub(crate) fn lock_counting_contention<'mutex, T>(
+    mutex: &'mutex parking_lot::Mutex<T>,
+    contentions: &AtomicUsize,
+) -> parking_lot::MutexGuard<'mutex, T> {
+    mutex.try_lock().unwrap_or_else(|| {
+        contentions.fetch_add(1, Ordering::Relaxed);
+        mutex.lock()
+    })
 }
 
 /// Marks the calling thread as the one calling the writer, until it is dropped.
@@ -147,6 +174,8 @@ impl<W> TraceSink<W> {
                 state: parking_lot::Mutex::new(GateState::Pending),
                 closed: AtomicBool::new(false),
                 writer_call: parking_lot::Mutex::default(),
+                #[cfg(test)]
+                close_contentions: AtomicUsize::new(0),
             }),
         }
     }
@@ -256,6 +285,9 @@ pub(crate) trait CloseSink: Send + Sync {
 
 impl<W: PerfettoWriter + Send + Sync> CloseSink for TraceSink<W> {
     fn close(&self) {
+        #[cfg(test)]
+        let mut state = lock_counting_contention(&self.gate.state, &self.gate.close_contentions);
+        #[cfg(not(test))]
         let mut state = self.gate.state.lock();
         let _calling_writer = CallingWriter::enter(&self.gate);
         self.close_locked(&mut state);

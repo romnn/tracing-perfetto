@@ -28,21 +28,10 @@ pub(crate) struct TraceLifecycle {
     /// The gate of the layer's sink, which outlives the sink to hold the first error for
     /// [`FinishHandle`].
     write_gate: Arc<WriteGate>,
-    /// The finishes that began to wait, which tests observe to release what those finishes wait
-    /// for only once they wait.
+    /// The finishes that found `sampler_join` held by another finish, so tests release the
+    /// sampler only once a finish waits for that join.
     #[cfg(test)]
-    waits_began: FinishWaits,
-}
-
-/// How many finishes began each wait of [`TraceLifecycle::finish`].
-#[cfg(test)]
-#[derive(Default)]
-struct FinishWaits {
-    /// The finishes that began to wait for the sampler, either to join it or for another
-    /// finish's join.
-    sampler: AtomicUsize,
-    /// The finishes that began to close the sink, which waits for the write in progress.
-    sink: AtomicUsize,
+    sampler_join_contentions: AtomicUsize,
 }
 
 impl TraceLifecycle {
@@ -55,7 +44,7 @@ impl TraceLifecycle {
             sink,
             write_gate,
             #[cfg(test)]
-            waits_began: FinishWaits::default(),
+            sampler_join_contentions: AtomicUsize::new(0),
         }
     }
 
@@ -86,8 +75,6 @@ impl TraceLifecycle {
             return false;
         }
         if let Some(sink) = self.sink.upgrade() {
-            #[cfg(test)]
-            self.waits_began.sink.fetch_add(1, Ordering::Relaxed);
             sink.close();
         }
         true
@@ -110,7 +97,11 @@ impl TraceLifecycle {
 
         // Any other thread
         #[cfg(test)]
-        self.waits_began.sampler.fetch_add(1, Ordering::Relaxed);
+        let _sampler_join = crate::sink::lock_counting_contention(
+            &self.sampler_join,
+            &self.sampler_join_contentions,
+        );
+        #[cfg(not(test))]
         let _sampler_join = self.sampler_join.lock();
         let stopping = self
             .process_memory_sampler
@@ -204,26 +195,32 @@ impl FinishHandle {
     }
 
     /// Returns whether a finish has taken the sampler thread to join it.
+    ///
+    /// Returns `false` while another thread holds the sampler's lock, so that a test polling
+    /// this never waits for a finish that holds the lock.
     #[cfg(test)]
     pub(crate) fn sampler_join_began(&self) -> bool {
         self.lifecycle
             .process_memory_sampler
-            .lock()
-            .as_ref()
-            .is_some_and(ProcessMemorySampler::is_handed_out)
+            .try_lock()
+            .is_some_and(|sampler| {
+                sampler
+                    .as_ref()
+                    .is_some_and(ProcessMemorySampler::is_handed_out)
+            })
     }
 
-    /// Returns how many finishes began to wait for the sampler, which they do on any thread but
-    /// the sampler thread and outside the writer.
+    /// Returns how many finishes had to wait for another finish's join of the sampler.
     #[cfg(test)]
-    pub(crate) fn sampler_waits_began(&self) -> usize {
-        self.lifecycle.waits_began.sampler.load(Ordering::Relaxed)
+    pub(crate) fn sampler_join_contentions(&self) -> usize {
+        self.lifecycle
+            .sampler_join_contentions
+            .load(Ordering::Relaxed)
     }
 
-    /// Returns how many finishes began to close the sink, after which each waits for the write
-    /// in progress.
+    /// Returns how many finishes had to wait for the write in progress to close the sink.
     #[cfg(test)]
-    pub(crate) fn sink_closes_began(&self) -> usize {
-        self.lifecycle.waits_began.sink.load(Ordering::Relaxed)
+    pub(crate) fn sink_close_contentions(&self) -> usize {
+        self.lifecycle.write_gate.close_contentions()
     }
 }

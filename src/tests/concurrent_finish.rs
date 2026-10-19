@@ -77,8 +77,9 @@ impl PausingProcessMemory {
             SourceFinish::First => {}
             SourceFinish::DuringAnotherFinish => {
                 // Wait until the other finish has taken the sampler thread to join it.
-                // The check takes the lock that the sampler's own finish takes, so a finish that
-                // held it while joining stalls this check as it would stall that finish.
+                // The check reads the sampler under the lock that the sampler's own finish takes,
+                // so a finish that held it while joining keeps the check false, and the test's
+                // bound reports the stall that the sampler's own finish would hit.
                 while !finish.sampler_join_began() {
                     std::thread::yield_now();
                 }
@@ -297,10 +298,10 @@ fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
     // Both finishes wait for the sampler before the test releases it, one joining it and the
     // other waiting for that join, and neither has returned.
     let observer = pausing.layer.finish_handle();
-    let both_wait = || observer.sampler_waits_began() == 2 && observer.sampler_join_began();
+    let both_wait = || observer.sampler_join_contentions() == 1 && observer.sampler_join_began();
     if !wait_until(FINISH_BOUND, both_wait) {
         std::mem::forget(pausing.layer);
-        return fail!("the finishes never began to wait for the sampler");
+        return fail!("no finish waited for another finish's join of the sampler");
     }
     let mut finish_returns: Vec<FinishReturn> = returns.try_iter().collect();
     expect_that!(
