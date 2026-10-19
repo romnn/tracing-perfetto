@@ -20,8 +20,10 @@ use tracing_subscriber::fmt::MakeWriter;
 /// A buffering sink, such as a [`BufWriter`](std::io::BufWriter), holds the end of the trace
 /// until something else flushes it ([#5]).
 /// `tracing_appender::non_blocking` drops messages when its queue is full unless it is built with
-/// `lossy(false)`, and its `WorkerGuard` must outlive the trace, because dropping the guard
-/// flushes the queue.
+/// `lossy(false)`.
+/// Drop its `WorkerGuard` after [`FinishHandle::finish`](crate::FinishHandle::finish): dropping
+/// the guard flushes the queue, but it waits about a second at most, so a large backlog can still
+/// lose its tail.
 ///
 /// A sink must not record spans or events, because it runs inside the layer's callbacks, which
 /// a span or event it records would reenter.

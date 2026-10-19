@@ -108,8 +108,8 @@ A `Mutex<File>` is the usual writer.
   layer never flushes it ([#5]).
 - `tracing_appender::non_blocking` drops messages when its queue is full unless it is built with
   `lossy(false)`, and a dropped message can leave the rest of the trace unreadable.
-  Keep its `WorkerGuard` alive until the trace is finished, since dropping the guard flushes the
-  queue.
+  Drop its `WorkerGuard` after `finish()`: dropping the guard flushes the queue, but it waits
+  about a second at most, so a large backlog can still lose its tail.
 - The writer must not record spans or events, which would reenter the layer from inside its own
   write.
 
