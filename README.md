@@ -45,7 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info_span!("work", perfetto.track_name = "jobs").in_scope(|| {
         tracing::info!("working");
     });
-    finish.finish();
+    // Reports the first failed write, after which the layer wrote nothing more.
+    finish.finish()?;
     Ok(())
 }
 ```
@@ -110,6 +111,8 @@ Issue [#11] tracks routing the events of a rejected span to its nearest recorded
 The layer writes each encoded `Trace` message as it happens, through one `write_all` call, so a
 trace cut short still holds everything written so far.
 A `Mutex<File>` is the usual writer.
+After the first failed write the layer writes nothing more, so the file stays readable up to that
+write, and `FinishHandle::finish` returns the error.
 
 - A buffering writer such as `BufWriter` keeps the end of the trace until it is flushed, and the
   layer never flushes it ([#5]).
@@ -122,14 +125,11 @@ A `Mutex<File>` is the usual writer.
 
 ## Known limitations
 
-- A failed or partial write can leave the rest of the trace unreadable, and nothing reports it
-  ([#4]).
 - `FinishHandle::finish` stops new writes, but a write already under way can still land after it
   returns, and the writer is not flushed ([#5]).
 - Spans must close under the dispatcher the layer is installed in: when a child span closes on a
   thread whose default dispatcher is another one, its parent's lifetime slice never ends ([#9]).
 
-[#4]: https://github.com/romnn/tracing-perfetto/issues/4
 [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 [#11]: https://github.com/romnn/tracing-perfetto/issues/11

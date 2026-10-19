@@ -9,7 +9,11 @@ use tracing_subscriber::fmt::MakeWriter;
 /// Each call hands over one complete `Trace` message, and messages written back to back decode as
 /// one trace, so a sink that appends every buffer in call order produces a valid trace file.
 /// The layer writes from every thread that records spans or events, and from its process-memory
-/// sampler thread, so a sink shared across threads must apply each buffer as a whole.
+/// sampler thread, but hands over one message at a time.
+///
+/// After the first failed write the layer writes nothing more, so the output is the trace up to
+/// that write, followed by whatever part of the failed message the sink took.
+/// [`FinishHandle::finish`](crate::FinishHandle::finish) returns the error.
 ///
 /// Every [`MakeWriter`] is a `PerfettoWriter` that writes each buffer with one
 /// [`write_all`](std::io::Write::write_all) call on a fresh writer, such as a
@@ -32,14 +36,9 @@ use tracing_subscriber::fmt::MakeWriter;
 pub trait PerfettoWriter {
     /// Writes one encoded perfetto `Trace` message.
     ///
-    /// The layer ignores the result, and a failed or partial write can leave the rest of the
-    /// trace unreadable ([#4]).
-    ///
-    /// [#4]: https://github.com/romnn/tracing-perfetto/issues/4
-    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying writer fails.
+    /// Returns an error if the underlying writer fails, which ends the layer's trace.
     fn write_log(&self, buf: BytesMut) -> std::io::Result<()>;
 }
 

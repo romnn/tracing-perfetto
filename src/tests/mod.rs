@@ -15,6 +15,7 @@ mod layer;
 mod thread_slices;
 mod tracks;
 mod wire;
+mod write_errors;
 
 /// A sink that a [`crate::PerfettoLayer`] writes to, accumulating the trace in memory.
 ///

@@ -686,7 +686,7 @@ fn exit_after_finish_writes_nothing() -> Result<()> {
 
     let span = trace_span!("finished");
     let entered = span.enter();
-    finish.finish();
+    finish.finish().or_fail()?;
     let finished_length = output.buf.lock().len();
     drop(entered);
     drop(span);

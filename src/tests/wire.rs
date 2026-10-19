@@ -387,7 +387,7 @@ fn packets_of_one_layer_share_one_valid_sequence_id() -> Result<()> {
     trace_span!("span").in_scope(|| tracing::info!("inside the span"));
     tracing::info!("outside any span");
     wait_for_written_sample(&announcements)?;
-    finish.finish();
+    finish.finish().or_fail()?;
 
     let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
 
@@ -485,7 +485,7 @@ fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
     trace_span!("span").in_scope(|| tracing::info!("inside the span"));
     tracing::info!("outside any span");
     wait_for_written_sample(&announcements)?;
-    finish.finish();
+    finish.finish().or_fail()?;
 
     let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
 
@@ -635,7 +635,7 @@ fn preamble_precedes_a_memory_sample_written_first() -> Result<()> {
     wait_for_written_sample(&announcements)?;
     trace_span!("span").in_scope(|| {});
     tracing::info!("outside any span");
-    finish.finish();
+    finish.finish().or_fail()?;
 
     let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
     expect_preamble_once(&trace)?;
@@ -669,7 +669,7 @@ fn preamble_precedes_a_span_written_first() -> Result<()> {
     trace_span!("span").in_scope(|| {});
     armed.store(true, Ordering::Release);
     wait_for_written_sample(&announcements)?;
-    finish.finish();
+    finish.finish().or_fail()?;
 
     let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
     expect_preamble_once(&trace)?;
@@ -710,7 +710,7 @@ fn concurrent_first_writes_all_follow_the_preamble() -> Result<()> {
         armed.store(true, Ordering::Release);
     });
     wait_for_written_sample(&announcements)?;
-    finish.finish();
+    finish.finish().or_fail()?;
 
     let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
     expect_preamble_once(&trace)?;

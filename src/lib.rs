@@ -99,18 +99,17 @@
 //! resident set size.
 //! A [`FinishHandle`] ends the trace while the layer is still installed, for example in a global
 //! dispatcher that is never dropped.
+//! [`FinishHandle::finish`] returns the writer's first error, after which the layer wrote nothing
+//! more, so the output stays readable up to the failed write.
 //!
 //! # Limitations
 //!
-//! - A failed or partial write can leave the rest of the trace unreadable, and nothing reports
-//!   it ([#4]).
 //! - Finishing stops new writes, but a write already under way can still land after
 //!   [`FinishHandle::finish`] returns, and the writer is not flushed ([#5]).
 //! - Spans must close under the dispatcher the layer is installed in: when a child span closes
 //!   on a thread whose default dispatcher is another one, its parent's lifetime slice never ends
 //!   ([#9]).
 //!
-//! [#4]: https://github.com/romnn/tracing-perfetto/issues/4
 //! [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 //! [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 //!
@@ -157,6 +156,7 @@ mod lifecycle;
 mod packets;
 pub mod process_memory;
 mod sequence;
+mod sink;
 mod span_state;
 mod thread_slices;
 mod thread_state;
