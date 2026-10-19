@@ -3,6 +3,7 @@
 
 use crate::process_memory::ProcessMemorySource;
 use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
+use crate::sink::TraceSink;
 use crate::tests::{TestWriter, decode, events_of_type};
 use crate::{FinishHandle, PerfettoLayer, idl};
 use googletest::prelude::*;
@@ -47,8 +48,15 @@ struct PausingProcessMemory {
     /// The handle of the trace that the source samples for, set once the layer is built.
     finish: Arc<OnceLock<FinishHandle>>,
     output: TestWriter,
-    /// Sends the length of the output when the source's own finish returned.
-    finished: mpsc::Sender<usize>,
+    /// Sends what the source observed when its own finish returned.
+    finished: mpsc::Sender<SourceFinishReturn>,
+}
+
+/// What a [`PausingProcessMemory`] observed right after its own finish returned.
+struct SourceFinishReturn {
+    /// The length of the output.
+    written: usize,
+    result: std::io::Result<()>,
 }
 
 impl PausingProcessMemory {
@@ -69,9 +77,13 @@ impl PausingProcessMemory {
                 }
             }
         }
-        finish.finish();
+        let result = finish.finish();
+        let source_return = SourceFinishReturn {
+            written: self.output.buf.lock().len(),
+            result,
+        };
         // The receiver is gone only after the test stopped waiting.
-        self.finished.send(self.output.buf.lock().len()).ok();
+        self.finished.send(source_return).ok();
     }
 }
 
@@ -97,8 +109,8 @@ struct PausingLayer {
     output: TestWriter,
     paused: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
-    /// Receives the length of the output when the source's own finish returned.
-    source_finished: mpsc::Receiver<usize>,
+    /// Receives what the source observed when its own finish returned.
+    source_finished: mpsc::Receiver<SourceFinishReturn>,
 }
 
 /// Returns a layer that samples a [`PausingProcessMemory`] every millisecond, which finishes the
@@ -136,22 +148,24 @@ fn pausing_layer(source_finish: SourceFinish) -> Result<PausingLayer> {
 struct FinishReturn {
     /// The length of the output.
     written: usize,
-    /// The strong references to the layer's writer, one of which a running sampler holds.
-    writer_references: usize,
+    /// The strong references to the layer's sink, one of which a running sampler holds.
+    sink_references: usize,
+    result: std::io::Result<()>,
 }
 
 /// Finishes the trace through `finish` on a new thread, and sends what it observed on return.
 fn finish_on_thread(
     finish: FinishHandle,
-    layer_writer: Weak<TestWriter>,
+    layer_sink: Weak<TraceSink<TestWriter>>,
     output: TestWriter,
     returned: mpsc::Sender<FinishReturn>,
 ) {
     std::thread::spawn(move || {
-        finish.finish();
+        let result = finish.finish();
         let finish_return = FinishReturn {
             written: output.buf.lock().len(),
-            writer_references: layer_writer.strong_count(),
+            sink_references: layer_sink.strong_count(),
+            result,
         };
         returned.send(finish_return).ok();
     });
@@ -175,14 +189,14 @@ fn sample_values(trace: &idl::Trace) -> Vec<i64> {
 #[gtest]
 fn finish_from_the_sampler_thread_during_another_finish_returns() -> Result<()> {
     let pausing = pausing_layer(SourceFinish::DuringAnotherFinish)?;
-    let layer_writer = Arc::clone(pausing.layer.writer());
+    let layer_sink = Arc::clone(pausing.layer.sink());
 
     // Finish while the sampler is paused in its second sample, which then finishes too.
     pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
     let (returned, returns) = mpsc::channel();
     finish_on_thread(
         pausing.layer.finish_handle(),
-        Arc::downgrade(&layer_writer),
+        Arc::downgrade(&layer_sink),
         pausing.output.make_writer(),
         returned,
     );
@@ -193,18 +207,21 @@ fn finish_from_the_sampler_thread_during_another_finish_returns() -> Result<()> 
         std::mem::forget(pausing.layer);
         return fail!("the test's finish deadlocked");
     };
-    let Ok(source_written) = pausing.source_finished.recv_timeout(FINISH_BOUND) else {
+    let Ok(source_return) = pausing.source_finished.recv_timeout(FINISH_BOUND) else {
         std::mem::forget(pausing.layer);
         return fail!("the sampler's own finish deadlocked or panicked");
     };
     drop(pausing.layer);
 
-    // The test's finish returned only after the sampler had stopped and released its writer.
-    expect_eq!(test_finish.writer_references, 2);
+    // Both finishes found every write succeeded.
+    expect_that!(test_finish.result, ok(anything()));
+    expect_that!(source_return.result, ok(anything()));
+    // The test's finish returned only after the sampler had stopped and released its sink.
+    expect_eq!(test_finish.sink_references, 2);
     // Nothing reached the writer after either finish returned.
     let written = pausing.output.buf.lock().len();
     expect_eq!(test_finish.written, written);
-    expect_eq!(source_written, written);
+    expect_eq!(source_return.written, written);
     // The sample read while the trace finished is discarded.
     let trace = decode(&pausing.output)?;
     let first_sample = i64::try_from(FIRST_SAMPLE).or_fail()?;
@@ -219,12 +236,12 @@ fn finish_from_the_sampler_thread_during_another_finish_returns() -> Result<()> 
 #[gtest]
 fn finish_from_the_sampler_thread_does_not_join_itself() -> Result<()> {
     let pausing = pausing_layer(SourceFinish::First)?;
-    let layer_writer = Arc::clone(pausing.layer.writer());
+    let layer_sink = Arc::clone(pausing.layer.sink());
 
     // The source finishes the trace from the sampler thread, then the test finishes it again.
     pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
     pausing.release.send(()).or_fail()?;
-    let Ok(source_written) = pausing.source_finished.recv_timeout(FINISH_BOUND) else {
+    let Ok(source_return) = pausing.source_finished.recv_timeout(FINISH_BOUND) else {
         // Dropping the layer would finish it too, which waits for the stuck finish.
         std::mem::forget(pausing.layer);
         return fail!("the sampler's own finish deadlocked or panicked");
@@ -232,7 +249,7 @@ fn finish_from_the_sampler_thread_does_not_join_itself() -> Result<()> {
     let (returned, returns) = mpsc::channel();
     finish_on_thread(
         pausing.layer.finish_handle(),
-        Arc::downgrade(&layer_writer),
+        Arc::downgrade(&layer_sink),
         pausing.output.make_writer(),
         returned,
     );
@@ -242,10 +259,13 @@ fn finish_from_the_sampler_thread_does_not_join_itself() -> Result<()> {
     };
     drop(pausing.layer);
 
-    // The later finish returned only after the sampler had stopped and released its writer.
-    expect_eq!(test_finish.writer_references, 2);
+    // Both finishes found every write succeeded.
+    expect_that!(test_finish.result, ok(anything()));
+    expect_that!(source_return.result, ok(anything()));
+    // The later finish returned only after the sampler had stopped and released its sink.
+    expect_eq!(test_finish.sink_references, 2);
     // Nothing reached the writer after the sampler's own finish returned.
-    expect_eq!(pausing.output.buf.lock().len(), source_written);
+    expect_eq!(pausing.output.buf.lock().len(), source_return.written);
     // The sample read while the trace finished is discarded.
     let trace = decode(&pausing.output)?;
     let first_sample = i64::try_from(FIRST_SAMPLE).or_fail()?;
@@ -260,7 +280,7 @@ fn finish_from_the_sampler_thread_does_not_join_itself() -> Result<()> {
 #[gtest]
 fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
     let pausing = pausing_layer(SourceFinish::Never)?;
-    let layer_writer = Arc::clone(pausing.layer.writer());
+    let layer_sink = Arc::clone(pausing.layer.sink());
 
     // Finish twice while the sampler is paused in its second sample.
     pausing.paused.recv_timeout(FINISH_BOUND).or_fail()?;
@@ -268,7 +288,7 @@ fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
     for _ in 0..2 {
         finish_on_thread(
             pausing.layer.finish_handle(),
-            Arc::downgrade(&layer_writer),
+            Arc::downgrade(&layer_sink),
             pausing.output.make_writer(),
             returned.clone(),
         );
@@ -297,10 +317,11 @@ fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
     }
     drop(pausing.layer);
 
-    // Each finish returned after the sampler had released its writer and written its last sample.
+    // Each finish returned after the sampler had released its sink and written its last sample.
     let written = pausing.output.buf.lock().len();
     for finish_return in finish_returns {
-        expect_eq!(finish_return.writer_references, 2);
+        expect_that!(finish_return.result, ok(anything()));
+        expect_eq!(finish_return.sink_references, 2);
         expect_eq!(finish_return.written, written);
     }
     Ok(())
