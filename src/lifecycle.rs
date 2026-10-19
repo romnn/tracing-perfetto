@@ -1,6 +1,6 @@
 //! Ending a layer's trace, whether the layer is dropped or finished through a [`FinishHandle`].
 
-use crate::process_memory::sampler::ProcessMemorySampler;
+use crate::process_memory::sampler::{ProcessMemorySampler, StoppingSampler};
 use crate::sink::{CloseSink, WriteGate};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,11 +10,14 @@ use std::sync::{Arc, Weak};
 ///
 /// The layer and its [`FinishHandle`]s share this state.
 pub(crate) struct TraceLifecycle {
-    /// The sampler, which stays here after it is stopped so that its thread still recognizes
-    /// itself while a finish joins it.
-    process_memory_sampler: parking_lot::Mutex<Option<ProcessMemorySampler>>,
+    process_memory_sampler: parking_lot::Mutex<SamplerSlot>,
     /// Held by a finish while it joins the sampler, so that a concurrent finish returns only
     /// after the sampler has stopped.
+    ///
+    /// A replacement holds it while it joins the replaced sampler, for the same reason.
+    /// It holds it on until its own sampler is in place, which the slot's `finished` flag does
+    /// not need but which lets a concurrent finish simply run before or after the whole
+    /// replacement.
     ///
     /// The sampler thread never takes it, and the join happens outside the
     /// `process_memory_sampler` lock, which the sampler thread takes when it finishes the trace.
@@ -32,6 +35,15 @@ pub(crate) struct TraceLifecycle {
     /// sampler only once a finish waits for that join.
     #[cfg(test)]
     sampler_join_contentions: AtomicUsize,
+}
+
+/// The trace's sampler, and whether a finish has begun, after which no sampler starts.
+#[derive(Default)]
+struct SamplerSlot {
+    /// The sampler, which stays here after it is stopped so that its thread still recognizes
+    /// itself while a finish joins it.
+    sampler: Option<ProcessMemorySampler>,
+    finished: bool,
 }
 
 impl TraceLifecycle {
@@ -80,13 +92,15 @@ impl TraceLifecycle {
         true
     }
 
-    /// Stops the sampler, and waits for it unless the calling thread is the sampler thread or
-    /// `inside_writer` says that it is inside a call to the writer.
+    /// Stops the sampler, if one runs, and keeps any later one from starting, and waits for it
+    /// unless the calling thread is the sampler thread or `inside_writer` says that it is inside
+    /// a call to the writer.
     fn stop_sampler(&self, inside_writer: bool) {
         // Sampler thread, or inside the writer
         {
-            let mut sampler = self.process_memory_sampler.lock();
-            let Some(sampler) = sampler.as_mut() else {
+            let mut slot = self.process_memory_sampler.lock();
+            slot.finished = true;
+            let Some(sampler) = slot.sampler.as_mut() else {
                 return;
             };
             if inside_writer || sampler.runs_on_current_thread() {
@@ -97,20 +111,32 @@ impl TraceLifecycle {
 
         // Any other thread
         #[cfg(test)]
-        let _sampler_join = crate::sink::lock_counting_contention(
+        let sampler_join = crate::sink::lock_counting_contention(
             &self.sampler_join,
             &self.sampler_join_contentions,
         );
         #[cfg(not(test))]
-        let _sampler_join = self.sampler_join.lock();
+        let sampler_join = self.sampler_join.lock();
+        let exit = self.join_sampler();
+        drop(sampler_join);
+        drop(exit);
+    }
+
+    /// Stops the sampler and waits for its thread to exit, unless no sampler runs or another
+    /// thread has taken it to join it, and returns how the thread exited.
+    ///
+    /// The caller holds the join lock, and drops what this returns only once it released that
+    /// lock: a sampler that panicked returns the panic's payload, whose `Drop` may finish the
+    /// trace, which takes the lock.
+    /// The panic is not propagated, since a sampler that panicked has stopped writing too.
+    fn join_sampler(&self) -> Option<std::thread::Result<()>> {
         let stopping = self
             .process_memory_sampler
             .lock()
+            .sampler
             .as_mut()
             .and_then(ProcessMemorySampler::stop);
-        if let Some(stopping) = stopping {
-            stopping.join();
-        }
+        stopping.map(StoppingSampler::join)
     }
 
     /// Returns whether the trace has ended, after which the layer writes nothing.
@@ -118,11 +144,20 @@ impl TraceLifecycle {
         self.write_gate.is_closed()
     }
 
-    /// Makes `sampler` the trace's sampler, and stops and joins the one it replaces.
-    pub(crate) fn replace_sampler(&self, sampler: ProcessMemorySampler) {
-        let replaced = self.process_memory_sampler.lock().replace(sampler);
-        if let Some(stopping) = replaced.and_then(|mut replaced| replaced.stop()) {
-            stopping.join();
+    /// Stops and joins the trace's sampler, if one runs, and then makes the sampler that `spawn`
+    /// starts the trace's sampler, unless a finish has begun.
+    ///
+    /// The caller must not be the sampler thread, which cannot join itself, nor be inside a call
+    /// to the writer, which the sampler may wait for.
+    pub(crate) fn replace_sampler(&self, spawn: impl FnOnce() -> ProcessMemorySampler) {
+        // Declared before the join lock, so that a panic payload of the replaced sampler drops
+        // only after the lock is released, also when spawning unwinds.
+        let _replaced_exit;
+        let _sampler_join = self.sampler_join.lock();
+        _replaced_exit = self.join_sampler();
+        let mut slot = self.process_memory_sampler.lock();
+        if !slot.finished {
+            slot.sampler = Some(spawn());
         }
     }
 }
@@ -204,8 +239,8 @@ impl FinishHandle {
         self.lifecycle
             .process_memory_sampler
             .try_lock()
-            .is_some_and(|sampler| {
-                sampler
+            .is_some_and(|slot| {
+                slot.sampler
                     .as_ref()
                     .is_some_and(ProcessMemorySampler::is_handed_out)
             })

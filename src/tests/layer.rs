@@ -4,7 +4,7 @@ use crate::PerfettoLayer;
 use crate::idl;
 use crate::idl::track_event;
 use crate::process_memory::sampler::MIN_SAMPLING_INTERVAL;
-use crate::tests::TestWriter;
+use crate::tests::{TestWriter, events_of_type};
 use googletest::prelude::*;
 use prost::Message;
 use std::sync::{Arc, mpsc};
@@ -249,6 +249,42 @@ fn announcing_layer(
     (layer, announced)
 }
 
+/// A writer that keeps nothing and announces each counter sample it is handed.
+#[derive(Clone)]
+struct SampleAnnouncingWriter {
+    announcements: mpsc::Sender<()>,
+}
+
+impl MakeWriter<'_> for SampleAnnouncingWriter {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl std::io::Write for SampleAnnouncingWriter {
+    /// Announces `buf` if it holds a counter sample.
+    ///
+    /// The layer hands each encoded `Trace` message to a single `write` call.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let is_sample = idl::Trace::decode(buf).is_ok_and(|trace| {
+            events_of_type(&trace, track_event::Type::Counter)
+                .next()
+                .is_some()
+        });
+        if is_sample {
+            // The receiver is gone only after the test stopped waiting for samples.
+            self.announcements.send(()).ok();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Finishing a trace stops a sampler that waits for its next sample without waiting for the rest
 /// of its interval.
 ///
@@ -256,11 +292,14 @@ fn announcing_layer(
 /// a process that finishes its trace at exit, for an hour with this interval.
 #[gtest]
 fn finish_stops_the_sampler_without_waiting_for_its_interval() -> Result<()> {
-    let (layer, announced) = announcing_layer(TestWriter::new(), Duration::from_secs(3600));
+    let (announcements, announced) = mpsc::channel();
+    let layer = PerfettoLayer::new(SampleAnnouncingWriter { announcements })
+        .with_process_memory_source(Duration::from_secs(3600), Box::new(FixedProcessMemory));
     let finish = layer.finish_handle();
 
-    // After its first sample, the sampler waits an hour for the next one.
-    announced.recv().or_fail()?;
+    // The sampler writes its first sample after its last check for a stop before it waits an
+    // hour for the next one, so the finish below can only stop it in that wait.
+    announced.recv_timeout(Duration::from_secs(30)).or_fail()?;
     let (finished, finished_receiver) = mpsc::channel();
     std::thread::spawn(move || {
         finished.send(finish.finish()).ok();

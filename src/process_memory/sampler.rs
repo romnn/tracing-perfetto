@@ -5,6 +5,7 @@ use crate::sink::TraceSink;
 use crate::writer::PerfettoWriter;
 use crate::{idl, packets};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
@@ -13,14 +14,36 @@ use std::time::Duration;
 /// busy loop.
 pub(crate) const MIN_SAMPLING_INTERVAL: Duration = Duration::from_millis(1);
 
+/// The `process.rss` counter track of a layer, which every sampler of the layer writes to.
+pub(crate) struct CounterTrack {
+    uuid: u64,
+    /// Whether the track's descriptor was written.
+    ///
+    /// A replacement sampler starts only after the sampler it replaces has exited, so the
+    /// samplers of a layer read and write it one after another.
+    described: AtomicBool,
+}
+
+impl CounterTrack {
+    /// Returns a track that is not described yet, with a new UUID.
+    pub(crate) fn new() -> Self {
+        Self {
+            uuid: packets::unique_uuid(),
+            described: AtomicBool::new(false),
+        }
+    }
+}
+
 /// What a [`ProcessMemorySampler`] samples and where it writes the samples.
 pub(crate) struct ProcessMemorySamplerConfig<W> {
     /// The layer's sink, so the samples share its sequence, clock and preamble.
     pub(crate) sink: Arc<TraceSink<W>>,
-    pub(crate) counter_track_uuid: u64,
+    pub(crate) counter_track: Arc<CounterTrack>,
     /// The interval between samples, raised to at least [`MIN_SAMPLING_INTERVAL`].
     pub(crate) interval: Duration,
-    pub(crate) source: Box<dyn ProcessMemorySource>,
+    /// The source, which the installing layer shares until it has released the lifecycle's
+    /// locks, so that its last reference never drops under them.
+    pub(crate) source: Arc<dyn ProcessMemorySource>,
 }
 
 /// A running sampler thread, which writes until [`Self::request_stop`] stops it.
@@ -40,8 +63,8 @@ pub(crate) struct ProcessMemorySampler {
 impl ProcessMemorySampler {
     /// Spawns a thread that samples `config.source` every `config.interval`.
     ///
-    /// The counter track's descriptor is written with the first sample, and the track counts as
-    /// described only once that write succeeds.
+    /// The counter track's descriptor is written with the first sample of the layer's first
+    /// sampler, and the track counts as described only once that write succeeds.
     /// Intervals without a value are skipped.
     /// A sample read while a stop is requested is not written, even when the source itself
     /// requested it.
@@ -53,28 +76,25 @@ impl ProcessMemorySampler {
         let (stop, stopped) = mpsc::channel::<()>();
         let interval = sampling_interval(config.interval);
 
-        let join_handle = std::thread::Builder::new()
-            .name("perfetto-process-memory".to_string())
-            .spawn(move || {
-                let mut wrote_descriptor = false;
-                loop {
-                    let rss_bytes = config.source.resident_set_size_bytes();
-                    // A stop requested while the source was read, possibly by the source
-                    // finishing the trace itself, discards the sample, which could otherwise
-                    // land after that finish returned.
-                    if stop_requested(&stopped) {
-                        break;
-                    }
-                    if let Some(rss_bytes) = rss_bytes {
-                        wrote_descriptor |= write_sample(&config, rss_bytes, !wrote_descriptor);
-                    }
-                    match stopped.recv_timeout(interval) {
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    }
+        let join_handle = spawn_thread(move || {
+            loop {
+                let rss_bytes = config.source.resident_set_size_bytes();
+                // A stop requested while the source was read, possibly by the source
+                // finishing the trace itself, discards the sample, which could otherwise
+                // land after that finish returned.
+                if stop_requested(&stopped) {
+                    break;
                 }
-            })
-            .ok();
+                if let Some(rss_bytes) = rss_bytes {
+                    write_sample(&config, rss_bytes);
+                }
+                match stopped.recv_timeout(interval) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .ok();
         let thread_id = join_handle.as_ref().map(|handle| handle.thread().id());
 
         Self {
@@ -120,13 +140,56 @@ impl ProcessMemorySampler {
 pub(crate) struct StoppingSampler(JoinHandle<()>);
 
 impl StoppingSampler {
-    /// Waits for the thread to exit, after which it writes nothing and has released the writer.
+    /// Waits for the thread to exit, after which it writes nothing and has released the writer,
+    /// and returns how it exited.
     ///
     /// The thread wakes from its wait between samples at once, so this waits only for a sample
     /// that is in progress.
-    pub(crate) fn join(self) {
-        // A sampler that panicked has stopped writing too, so its panic is not propagated.
-        let _ = self.0.join();
+    /// A thread that panicked returns the panic's payload, whose `Drop` is user code that may
+    /// finish the trace, so the caller drops it only after releasing the layer's locks.
+    pub(crate) fn join(self) -> std::thread::Result<()> {
+        self.0.join()
+    }
+}
+
+/// Spawns `thread` as a sampler thread.
+///
+/// When the thread cannot be spawned, `thread` is dropped on the calling thread.
+fn spawn_thread(thread: impl FnOnce() + Send + 'static) -> std::io::Result<JoinHandle<()>> {
+    #[cfg(test)]
+    if FAILING_SPAWNS.with(std::cell::Cell::get) {
+        // The standard library drops the thread's closure on the calling thread, too, when the
+        // system refuses a thread.
+        drop(thread);
+        return Err(std::io::Error::other("injected sampler spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name("perfetto-process-memory".to_string())
+        .spawn(thread)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether spawning a sampler thread from the calling thread fails.
+    static FAILING_SPAWNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes spawning a sampler thread from the calling thread fail, until it is dropped.
+#[cfg(test)]
+pub(crate) struct FailingSpawns(());
+
+#[cfg(test)]
+impl FailingSpawns {
+    pub(crate) fn begin() -> Self {
+        FAILING_SPAWNS.with(|failing| failing.set(true));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailingSpawns {
+    fn drop(&mut self) {
+        FAILING_SPAWNS.with(|failing| failing.set(false));
     }
 }
 
@@ -143,19 +206,20 @@ pub(crate) fn sampling_interval(requested: Duration) -> Duration {
     requested.max(MIN_SAMPLING_INTERVAL)
 }
 
-/// Writes one counter sample of `rss_bytes`, preceded by the counter track's descriptor if
-/// `include_descriptor` is set, and returns whether the sample was written.
-fn write_sample<W: PerfettoWriter>(
-    config: &ProcessMemorySamplerConfig<W>,
-    rss_bytes: u64,
-    include_descriptor: bool,
-) -> bool {
+/// Writes one counter sample of `rss_bytes`, preceded by the counter track's descriptor until a
+/// write of it succeeds.
+fn write_sample<W: PerfettoWriter>(config: &ProcessMemorySamplerConfig<W>, rss_bytes: u64) {
+    let track = &config.counter_track;
+    // A replacement sampler is spawned only after the sampler it replaces was joined, and a join
+    // and a spawn each order the memory accesses of the two threads, so the flag needs no
+    // ordering of its own.
+    let include_descriptor = !track.described.load(Ordering::Relaxed);
     let sequence = config.sink.sequence();
     let mut packet = sequence.timestamped_packet();
 
     let counter_value = i64::try_from(rss_bytes).unwrap_or(i64::MAX);
     let mut event = idl::TrackEvent {
-        track_uuid: Some(config.counter_track_uuid),
+        track_uuid: Some(track.uuid),
         counter_value_field: Some(idl::track_event::CounterValueField::CounterValue(
             counter_value,
         )),
@@ -169,7 +233,7 @@ fn write_sample<W: PerfettoWriter>(
         let mut counter = idl::CounterDescriptor::default();
         counter.set_unit(idl::counter_descriptor::Unit::SizeBytes);
         trace_packets.push(packets::track_descriptor_packet(idl::TrackDescriptor {
-            uuid: Some(config.counter_track_uuid),
+            uuid: Some(track.uuid),
             parent_uuid: Some(sequence.process_track_uuid()),
             static_or_dynamic_name: Some(packets::track_name("process.rss")),
             counter: Some(counter),
@@ -178,7 +242,10 @@ fn write_sample<W: PerfettoWriter>(
     }
     trace_packets.push(packet);
 
-    config.sink.write(&idl::Trace {
+    let written = config.sink.write(&idl::Trace {
         packet: trace_packets,
-    })
+    });
+    if written && include_descriptor {
+        track.described.store(true, Ordering::Relaxed);
+    }
 }

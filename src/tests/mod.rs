@@ -14,6 +14,7 @@ mod cross_dispatcher;
 mod entered_stack;
 mod finish;
 mod layer;
+mod sampler_lifecycle;
 mod thread_slices;
 mod tracks;
 mod user_formatting;

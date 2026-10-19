@@ -4,7 +4,9 @@
 use crate::fields::{DebugAnnotations, NamingFields};
 use crate::lifecycle::{FinishHandle, TraceLifecycle};
 use crate::packets::{self, SourceLocation, UnplacedEvent};
-use crate::process_memory::sampler::{ProcessMemorySampler, ProcessMemorySamplerConfig};
+use crate::process_memory::sampler::{
+    CounterTrack, ProcessMemorySampler, ProcessMemorySamplerConfig,
+};
 use crate::process_memory::{self, ProcessMemorySource};
 use crate::sink::TraceSink;
 use crate::span_state::{
@@ -43,7 +45,7 @@ pub struct PerfettoLayer<W> {
     config: Config,
     threads: ThreadStates,
     /// The counter track of the process-memory samples, which every sampler of the layer reuses.
-    process_memory_rss_track_uuid: u64,
+    process_memory_rss_track: Arc<CounterTrack>,
     lifecycle: Arc<TraceLifecycle>,
 }
 
@@ -84,7 +86,7 @@ impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
             sink,
             config: Config::default(),
             threads: ThreadStates::new(layer_id),
-            process_memory_rss_track_uuid: packets::unique_uuid(),
+            process_memory_rss_track: Arc::new(CounterTrack::new()),
             lifecycle,
         }
     }
@@ -159,23 +161,30 @@ impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
     ///
     /// Intervals in which `source` reports no value are skipped, and an `interval` shorter than
     /// one millisecond samples every millisecond.
-    /// Calling this again stops and joins the previous sampler, although only after the new one
-    /// has started ([#7]).
-    ///
-    /// [#7]: https://github.com/romnn/tracing-perfetto/issues/7
+    /// Calling this again stops the previous sampler and waits for the sample it is reading, if
+    /// any, before the new one starts, and the new one continues the previous one's track.
+    /// Once the trace is finished, no sampler starts, and `source` is dropped.
+    /// It must not be called from the memory source or from the writer, since it waits for the
+    /// previous sampler, which may be the very thread that calls it.
     #[must_use]
     pub fn with_process_memory_source(
         self,
         interval: Duration,
         source: Box<dyn ProcessMemorySource>,
     ) -> Self {
-        let sampler = ProcessMemorySampler::spawn(ProcessMemorySamplerConfig {
-            sink: Arc::clone(&self.sink),
-            counter_track_uuid: self.process_memory_rss_track_uuid,
-            interval,
-            source,
+        let source: Arc<dyn ProcessMemorySource> = Arc::from(source);
+        self.lifecycle.replace_sampler(|| {
+            ProcessMemorySampler::spawn(ProcessMemorySamplerConfig {
+                sink: Arc::clone(&self.sink),
+                counter_track: Arc::clone(&self.process_memory_rss_track),
+                interval,
+                source: Arc::clone(&source),
+            })
         });
-        self.lifecycle.replace_sampler(sampler);
+        // The source's `Drop` may finish the trace, which takes the lifecycle's locks, so a source
+        // that no sampler took, such as one whose thread could not be spawned under those locks,
+        // is dropped only here.
+        drop(source);
         self
     }
 }
