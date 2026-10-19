@@ -88,20 +88,17 @@
 //! use tracing_perfetto::PerfettoLayer;
 //! use tracing_subscriber::layer::SubscriberExt;
 //!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let file = std::fs::File::create(std::env::temp_dir().join("example.pftrace"))?;
-//! let layer = PerfettoLayer::new(std::sync::Mutex::new(file))
+//! // A `std::sync::Mutex<std::fs::File>` writes the trace to a file instead.
+//! let layer = PerfettoLayer::new(std::io::sink)
 //!     .with_debug_annotations(true)
 //!     .with_process_memory_rss(std::time::Duration::from_millis(100));
-//! let finish = layer.finish_handle();
 //!
+//! // The subscriber, and with it the layer, is dropped at the end of the scope, which ends the
+//! // trace.
 //! tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
 //!     let _span = tracing::info_span!("work", perfetto.track_name = "jobs").entered();
 //!     tracing::info!("working");
 //! });
-//! finish.finish();
-//! # Ok(())
-//! # }
 //! ```
 //!
 //! [Perfetto]: https://perfetto.dev
