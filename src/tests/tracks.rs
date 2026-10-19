@@ -4,7 +4,7 @@
 use crate::PerfettoLayer;
 use crate::idl;
 use crate::idl::track_event;
-use crate::test_support::{
+use crate::tests::{
     ReplayedSlice, TestWriter, annotated_layer, annotation_names, close_labeled, decode,
     decode_writes, events_of_type, instant_marked, replay_lifetime_slices, replay_slices,
     slice_named, span_track_descriptors, thread_track_uuids, track_descriptor, track_event,
@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::instrument::{Instrument as _, WithSubscriber as _};
 use tracing::{field, trace_span};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt};
 
 /// Returns the UUID of the one span track named `name`.
@@ -50,7 +52,7 @@ fn ended_slice_names(slices: &[ReplayedSlice]) -> Vec<&str> {
 #[gtest]
 fn overlapping_spans_with_one_track_name_get_distinct_tracks() -> Result<()> {
     let (layer, output) = annotated_layer();
-    let process_track_uuid = layer.sequence.process_track_uuid();
+    let process_track_uuid = layer.process_track_uuid();
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
     // The first begins, the second begins, the first ends and the second ends.
@@ -106,7 +108,7 @@ fn overlapping_spans_with_one_track_name_get_distinct_tracks() -> Result<()> {
 #[gtest]
 fn sequential_children_nest_on_the_parent_track() -> Result<()> {
     let (layer, output) = annotated_layer();
-    let process_track_uuid = layer.sequence.process_track_uuid();
+    let process_track_uuid = layer.process_track_uuid();
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
     let root = trace_span!("root", closes = field::Empty);
@@ -157,6 +159,278 @@ fn sequential_children_nest_on_the_parent_track() -> Result<()> {
             eq(&("grandchild", root_track, 2, true)),
         ]
     );
+    Ok(())
+}
+
+/// Returns a subscriber in which `layer` records every span except those named `filtered_out`.
+///
+/// Another layer records every span, so a filtered-out span exists in the registry instead of
+/// being disabled at its callsite.
+fn filtering_out_one_span(
+    layer: PerfettoLayer<TestWriter>,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    let layer = layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out"));
+    let every_span = tracing_subscriber::fmt::layer().with_writer(std::io::sink);
+    tracing_subscriber::registry().with(layer).with(every_span)
+}
+
+/// Under a per-layer filter, a child of a filtered-out span nests on its nearest recorded
+/// ancestor's track, and events inside the filtered-out span are instants there.
+///
+/// The filtered-out span has no slice, so a child that looked only at its direct parent would
+/// become a root on a track of its own, and an event inside that parent would land on the
+/// thread's track, splitting one call chain across unrelated tracks.
+#[gtest]
+fn child_of_a_filtered_out_span_nests_on_its_nearest_recorded_ancestor() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
+
+    trace_span!("root").in_scope(|| {
+        trace_span!("filtered_out").in_scope(|| {
+            tracing::info!(marker = "in the filtered-out span");
+            trace_span!("child").in_scope(|| {});
+        });
+    });
+
+    let trace = decode(&output)?;
+    let slices = replay_slices(&trace)?;
+    let [thread_track] = thread_track_uuids(&trace)[..] else {
+        return fail!("expected one thread track");
+    };
+
+    // The root's track is the only span track, and the child nests on it below the root.
+    let root_track = span_track_named(&trace, "root")?;
+    expect_that!(span_track_descriptors(&trace), len(eq(1)));
+    let lifetimes: Vec<_> = replay_lifetime_slices(&trace)?
+        .into_iter()
+        .map(|slice| (slice.name, slice.track_uuid, slice.depth))
+        .collect();
+    expect_that!(
+        lifetimes,
+        elements_are![
+            eq(&("root".to_string(), root_track, 0)),
+            eq(&("child".to_string(), root_track, 1))
+        ]
+    );
+
+    // The event inside the filtered-out span is an instant on the root's track.
+    expect_eq!(
+        instant_marked(&trace, "in the filtered-out span")?
+            .event
+            .track_uuid,
+        Some(root_track)
+    );
+
+    // The filtered-out span has no slice on any track, the thread's included.
+    expect_that!(
+        slices
+            .iter()
+            .filter(|slice| slice.track_uuid == thread_track)
+            .map(|slice| (slice.name.as_str(), slice.depth))
+            .collect::<Vec<_>>(),
+        elements_are![eq(&("root", 0)), eq(&("child", 1))]
+    );
+    Ok(())
+}
+
+/// Under a per-layer filter, an event whose explicit parent is a filtered-out span is an
+/// instant on the thread's track, even inside a recorded span.
+///
+/// The layer cannot see a filtered-out span, so it cannot reach that span's recorded
+/// ancestors, and routing the event by the current span instead would place it under a span it
+/// does not belong to.
+#[gtest]
+fn event_with_a_filtered_out_explicit_parent_goes_to_the_thread_track() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
+
+    let root = trace_span!("root");
+    let filtered_out = trace_span!(parent: &root, "filtered_out");
+    trace_span!("current").in_scope(|| {
+        tracing::info!(parent: &filtered_out, marker = "explicit parent");
+    });
+    drop(filtered_out);
+    drop(root);
+
+    let trace = decode(&output)?;
+    let [thread_track] = thread_track_uuids(&trace)[..] else {
+        return fail!("expected one thread track");
+    };
+    expect_eq!(
+        instant_marked(&trace, "explicit parent")?.event.track_uuid,
+        Some(thread_track)
+    );
+    Ok(())
+}
+
+/// Under a per-layer filter, an event in a filtered-out span that is entered outside its
+/// recorded ancestor, as a spawned task's span is on a worker thread, is an instant on the
+/// thread's track.
+///
+/// Events reach a recorded ancestor through the spans entered on the recording thread, so a
+/// recorded ancestor that is not entered there is out of reach, and a recorded child of the
+/// filtered-out span still nests on that ancestor.
+#[gtest]
+fn event_in_a_filtered_out_span_entered_elsewhere_goes_to_the_thread_track() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let dispatch = tracing::Dispatch::new(filtering_out_one_span(layer));
+    let (root, filtered_out) = tracing::dispatcher::with_default(&dispatch, || {
+        let root = trace_span!("root");
+        let filtered_out = trace_span!(parent: &root, "filtered_out");
+        (root, filtered_out)
+    });
+
+    // The worker enters only the filtered-out span, as when it polls a task instrumented with it.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("worker".to_string())
+            .spawn_scoped(scope, || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    filtered_out.in_scope(|| {
+                        tracing::info!(marker = "on the worker");
+                        trace_span!("child").in_scope(|| {});
+                    });
+                });
+            })
+            .or_fail()?
+            .join()
+            .or_fail()
+    })?;
+    drop(filtered_out);
+    drop(root);
+
+    let trace = decode(&output)?;
+    let worker_track = trace
+        .packet
+        .iter()
+        .filter_map(track_descriptor)
+        .find(|descriptor| descriptor.thread.is_some() && track_name(descriptor) == Some("worker"))
+        .map(idl::TrackDescriptor::uuid)
+        .or_fail()?;
+    expect_eq!(
+        instant_marked(&trace, "on the worker")?.event.track_uuid,
+        Some(worker_track)
+    );
+
+    // The child created inside the filtered-out span nests on the root's track.
+    let root_track = span_track_named(&trace, "root")?;
+    let slices = replay_lifetime_slices(&trace)?;
+    expect_eq!(slice_named(&slices, "child")?.track_uuid, root_track);
+    expect_eq!(slice_named(&slices, "child")?.depth, 1);
+    Ok(())
+}
+
+/// Under a per-layer filter, an event in a filtered-out span goes on the track of the innermost
+/// recorded span entered on the thread, even when that span is unrelated to the filtered-out
+/// span.
+///
+/// The layer finds an event's span through the spans entered on the recording thread, skipping
+/// the ones it does not record, so it cannot tell an unrelated entered span from an ancestor.
+#[gtest]
+fn event_in_a_filtered_out_span_goes_to_the_innermost_entered_recorded_span() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
+
+    let root = trace_span!("root");
+    let filtered_out = trace_span!(parent: &root, "filtered_out");
+    trace_span!("unrelated").in_scope(|| {
+        filtered_out.in_scope(|| tracing::info!(marker = "in the filtered-out span"));
+    });
+    drop(filtered_out);
+    drop(root);
+
+    let trace = decode(&output)?;
+    expect_eq!(
+        instant_marked(&trace, "in the filtered-out span")?
+            .event
+            .track_uuid,
+        Some(span_track_named(&trace, "unrelated")?)
+    );
+    Ok(())
+}
+
+/// When no layer enables a filtered-out span's callsite, a span created inside a task that the
+/// filtered-out span instruments, polled on another thread, is a root.
+///
+/// The filtered-out span is `Span::none`, so entering it on the worker enters nothing, and the
+/// worker has no current span that the new span could nest under.
+#[gtest]
+fn child_in_a_task_instrumented_with_a_span_no_layer_enables_is_a_root() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let layer = layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out"));
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+
+    let root = tracing::dispatcher::with_default(&dispatch, || trace_span!("root"));
+    let task_span = root.in_scope(|| trace_span!("filtered_out"));
+    expect_true!(task_span.is_disabled());
+
+    // The worker polls a task instrumented with the filtered-out span.
+    let task = async { trace_span!("child").in_scope(|| {}) }.instrument(task_span);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let mut task = std::pin::pin!(task);
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    task.as_mut().poll(&mut context).is_ready()
+                })
+            })
+            .join()
+    })
+    .or_fail()
+    .and_then(|ready| verify_true!(ready))?;
+    drop(root);
+
+    let trace = decode(&output)?;
+    let process_track_uuid = trace
+        .packet
+        .iter()
+        .filter_map(track_descriptor)
+        .find(|descriptor| descriptor.process.is_some())
+        .map(idl::TrackDescriptor::uuid)
+        .or_fail()?;
+    let child_track = span_track_named(&trace, "child")?;
+    let child_descriptor = span_track_descriptors(&trace)
+        .into_iter()
+        .find(|descriptor| descriptor.uuid() == child_track)
+        .or_fail()?;
+    expect_eq!(child_descriptor.parent_uuid, Some(process_track_uuid));
+    expect_ne!(child_track, span_track_named(&trace, "root")?);
+    Ok(())
+}
+
+/// When no layer enables a filtered-out span's callsite, the span does not exist, so a span
+/// that names it as its explicit parent is a root with a track of its own.
+///
+/// The registry never creates the filtered-out span, so nothing links the child to the spans
+/// the filtered-out span would have nested in.
+#[gtest]
+fn child_of_a_span_no_layer_enables_is_a_root() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let layer = layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out"));
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+    let root = trace_span!("root");
+    let filtered_out = trace_span!(parent: &root, "filtered_out");
+    expect_true!(filtered_out.is_disabled());
+    trace_span!(parent: &filtered_out, "child").in_scope(|| {});
+    drop(root);
+
+    let trace = decode(&output)?;
+    let process_track_uuid = trace
+        .packet
+        .iter()
+        .filter_map(track_descriptor)
+        .find(|descriptor| descriptor.process.is_some())
+        .map(idl::TrackDescriptor::uuid)
+        .or_fail()?;
+    let child_track = span_track_named(&trace, "child")?;
+    let child_descriptor = span_track_descriptors(&trace)
+        .into_iter()
+        .find(|descriptor| descriptor.uuid() == child_track)
+        .or_fail()?;
+    expect_eq!(child_descriptor.parent_uuid, Some(process_track_uuid));
+    expect_ne!(child_track, span_track_named(&trace, "root")?);
     Ok(())
 }
 
@@ -362,6 +636,49 @@ fn unscoped_events_go_to_the_thread_track() -> Result<()> {
     expect_eq!(
         instant_marked(&trace, "rootless")?.event.track_uuid,
         Some(thread_track)
+    );
+    Ok(())
+}
+
+/// A span with both `perfetto.track_name` and `otel.name` names its track after the track name
+/// and its slices after `otel.name`.
+///
+/// The track name names only the span's track, so slices named after it would lose the name
+/// that `otel.name` gives the span, and a track named after `otel.name` would not merge with
+/// the other tracks of the track name.
+#[gtest]
+fn track_name_names_the_track_and_otel_name_the_slices() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+    let otel_name = String::from("otel-name");
+    trace_span!(
+        "static_span",
+        { "perfetto.track_name" } = "my-task",
+        { "otel.name" } = %otel_name
+    )
+    .in_scope(|| {});
+
+    let trace = decode(&output)?;
+    let slices = replay_slices(&trace)?;
+
+    // The span's only track is named after the track name.
+    let track = span_track_named(&trace, "my-task")?;
+    expect_that!(span_track_descriptors(&trace), len(eq(1)));
+
+    // The lifetime slice on that track and the entered slice are named after `otel.name`.
+    expect_that!(
+        slices
+            .iter()
+            .map(|slice| slice.name.as_str())
+            .collect::<Vec<_>>(),
+        elements_are![eq(&"otel-name"), eq(&"otel-name")]
+    );
+    expect_eq!(
+        replay_lifetime_slices(&trace)?
+            .first()
+            .map(|lifetime| lifetime.track_uuid),
+        Some(track)
     );
     Ok(())
 }
