@@ -16,6 +16,10 @@ use tracing_subscriber::fmt::MakeWriter;
 /// [`FinishHandle::finish`](crate::FinishHandle::finish) returns the error.
 /// A sink that panics in a write or flush fails the trace the same way, and the panic propagates
 /// to the code that recorded the span or event, or to the finish that flushed.
+/// On the process-memory sampler thread the panic ends the sampler, and only
+/// [`FinishHandle::finish`](crate::FinishHandle::finish) reports it.
+/// A panic while the thread already unwinds from another panic, such as in the end of a span
+/// that the unwinding drops, is caught instead, because a second panic there aborts the process.
 /// The layer never calls a sink that panicked again, not even to flush it, since the panic may
 /// have broken it, as it poisons the `Mutex` of a `Mutex<File>`.
 ///
@@ -35,8 +39,9 @@ use tracing_subscriber::fmt::MakeWriter;
 /// the guard flushes the queue, but it waits about a second at most, so a large backlog can still
 /// lose its tail.
 ///
-/// A sink must not record spans or events: the layer calls it while holding the lock that every
-/// write of the trace takes, so a span or event that the sink records deadlocks on that lock.
+/// Spans and events that a sink records while the layer calls it, on that thread, as a panic
+/// hook that records the sink's panic does, are not written: the layer calls the sink while
+/// holding the lock that every write of the trace takes, which their writes cannot wait for.
 /// A sink may finish the trace from inside a write or flush, on the thread that the layer calls
 /// it on: that finish returns at once, and the trace ends when the write returns.
 /// A sink must not wait for a finish on another thread, including one that it spawns and joins,
