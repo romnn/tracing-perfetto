@@ -136,7 +136,8 @@ impl LifetimeSlice {
         // closes.
         debug_assert!(
             !self.track_occupied,
-            "a span closed while a child's slice nests on its track"
+            "a span closed while a child's slice nests on its track, as when spans close under \
+             another dispatcher (https://github.com/romnn/tracing-perfetto/issues/9)"
         );
         if let Some(occupied_id) = self.occupies
             && let Some(occupied) = ctx.span(&occupied_id)
