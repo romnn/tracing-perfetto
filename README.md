@@ -120,8 +120,8 @@ write, and `FinishHandle::finish` returns the error.
   `lossy(false)`, and a dropped message can leave the rest of the trace unreadable.
   Drop its `WorkerGuard` after `finish()`: dropping the guard flushes the queue, but it waits
   about a second at most, so a large backlog can still lose its tail.
-- The writer must not record spans or events, which would reenter the layer from inside its own
-  write.
+- The writer must not record spans or events: the layer calls it while holding the lock that
+  every write of the trace takes, so a span or event that the writer records deadlocks.
 
 ## Known limitations
 

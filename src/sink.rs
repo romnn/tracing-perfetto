@@ -23,12 +23,17 @@ pub(crate) struct TraceSink<W> {
 /// Whether a sink's writes reach its writer, shared with the [`FinishHandle`]s that report the
 /// first write error.
 ///
-/// Every write happens under its lock, so writes reach the writer one at a time and in the order
-/// in which they took the lock.
+/// Every write happens under its state lock, so writes reach the writer one at a time and in the
+/// order in which they took the lock.
 ///
 /// [`FinishHandle`]: crate::FinishHandle
 pub(crate) struct WriteGate {
     state: parking_lot::Mutex<GateState>,
+    /// The error of the failed write, until a [`FinishHandle`](crate::FinishHandle) reports it.
+    ///
+    /// It has a lock of its own, which is never held across a write, so a writer that finishes
+    /// the trace from inside its own write does not wait for the state lock that write holds.
+    error: parking_lot::Mutex<Option<std::io::Error>>,
 }
 
 enum GateState {
@@ -37,20 +42,15 @@ enum GateState {
     /// The preamble is written, and every write so far succeeded.
     Open,
     /// A write failed, so no more writes reach the writer.
-    Failed {
-        /// The error of the failed write, until a [`FinishHandle`](crate::FinishHandle)
-        /// reports it.
-        error: Option<std::io::Error>,
-    },
+    Failed,
 }
 
 impl WriteGate {
     /// Returns the error of the write that closed the gate, unless it was taken already.
+    ///
+    /// The error of a write still in progress is not reported yet.
     pub(crate) fn take_error(&self) -> Option<std::io::Error> {
-        match &mut *self.state.lock() {
-            GateState::Failed { error } => error.take(),
-            GateState::Pending | GateState::Open => None,
-        }
+        self.error.lock().take()
     }
 }
 
@@ -62,6 +62,7 @@ impl<W> TraceSink<W> {
             sequence: TraceSequence::new(),
             gate: Arc::new(WriteGate {
                 state: parking_lot::Mutex::new(GateState::Pending),
+                error: parking_lot::Mutex::default(),
             }),
         }
     }
@@ -91,7 +92,7 @@ impl<W: PerfettoWriter> TraceSink<W> {
 
         let mut state = self.gate.state.lock();
         match *state {
-            GateState::Failed { .. } => return false,
+            GateState::Failed => return false,
             GateState::Open => {}
             GateState::Pending => {
                 let Some(preamble) = encode(&self.sequence.preamble_trace()) else {
@@ -111,7 +112,9 @@ impl<W: PerfettoWriter> TraceSink<W> {
         match self.writer.write_log(message) {
             Ok(()) => true,
             Err(err) => {
-                *state = GateState::Failed { error: Some(err) };
+                // Only the first failure gets here, since the gate stays closed after it.
+                *state = GateState::Failed;
+                *self.gate.error.lock() = Some(err);
                 false
             }
         }

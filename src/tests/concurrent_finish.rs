@@ -326,3 +326,65 @@ fn concurrent_finishes_return_after_the_sampler_stopped() -> Result<()> {
     }
     Ok(())
 }
+
+/// A writer that finishes the trace when the sampler thread first writes through it, and sends
+/// what that finish returned.
+struct FinishingWriter {
+    /// The handle of the trace that the writer writes, set once the layer is built.
+    finish: Arc<OnceLock<FinishHandle>>,
+    /// Sends the result of the writer's own finish, once.
+    finished: Mutex<Option<mpsc::Sender<std::io::Result<()>>>>,
+}
+
+impl<'a> MakeWriter<'a> for FinishingWriter {
+    type Writer = std::io::Sink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let on_sampler_thread = std::thread::current().name() == Some("perfetto-process-memory");
+        if on_sampler_thread
+            && let Some(finish) = self.finish.get()
+            && let Some(finished) = self.finished.lock().take()
+        {
+            // The receiver is gone only after the test stopped waiting.
+            finished.send(finish.finish()).ok();
+        }
+        std::io::sink()
+    }
+}
+
+/// A writer that finishes the trace from the sampler thread, inside the sampler's write, gets
+/// the finish's result back.
+///
+/// A finish that waited for the write in progress to report its error would wait for the very
+/// write that called it, and deadlock the sampler.
+#[gtest]
+fn finish_from_the_writer_on_the_sampler_thread_returns() -> Result<()> {
+    let finish = Arc::new(OnceLock::new());
+    let (finished, writer_finished) = mpsc::channel();
+    let writer = FinishingWriter {
+        finish: Arc::clone(&finish),
+        finished: Mutex::new(Some(finished)),
+    };
+    let layer = PerfettoLayer::new(writer)
+        .with_process_memory_source(MIN_SAMPLING_INTERVAL, Box::new(FixedProcessMemory));
+    // The writer finishes only once it can read the handle, so a sample written before this
+    // finishes nothing.
+    finish.set(layer.finish_handle()).or_fail()?;
+
+    let Ok(result) = writer_finished.recv_timeout(FINISH_BOUND) else {
+        // Dropping the layer would finish it too, which waits for the stuck sampler.
+        std::mem::forget(layer);
+        return fail!("the writer's finish deadlocked");
+    };
+    drop(layer);
+    verify_that!(result, ok(anything()))
+}
+
+/// A memory source that always reports 1 KiB.
+struct FixedProcessMemory;
+
+impl ProcessMemorySource for FixedProcessMemory {
+    fn resident_set_size_bytes(&self) -> Option<u64> {
+        Some(1024)
+    }
+}

@@ -29,8 +29,11 @@ use tracing_subscriber::fmt::MakeWriter;
 /// the guard flushes the queue, but it waits about a second at most, so a large backlog can still
 /// lose its tail.
 ///
-/// A sink must not record spans or events, because it runs inside the layer's callbacks, which
-/// a span or event it records would reenter.
+/// A sink must not record spans or events: the layer calls it while holding the lock that every
+/// write of the trace takes, so a span or event that the sink records deadlocks on that lock.
+/// Reentering the layer from inside its own write was never safe.
+/// A sink may finish the trace from the process-memory sampler thread, but a finish from any
+/// other thread can deadlock with a sampler that waits to write.
 ///
 /// [#5]: https://github.com/romnn/tracing-perfetto/issues/5
 pub trait PerfettoWriter {
