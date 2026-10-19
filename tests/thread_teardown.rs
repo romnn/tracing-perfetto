@@ -44,13 +44,11 @@ thread_local! {
     static RECORDS_ON_DROP: RecordsOnDrop = const { RecordsOnDrop };
 }
 
-/// An event recorded by a thread-local destructor, after the layer's per-thread state is gone,
-/// is written without a panic.
+/// An event recorded by a thread-local destructor is written without a panic.
 ///
-/// The value is created before the thread first records, so it is destroyed after the
-/// thread-local values that the layer and its per-thread storage rely on.
-/// Looking up the layer's per-thread state then would panic inside a thread-local destructor,
-/// which aborts the process.
+/// The value is created before the thread first records, so its destructor may run after the
+/// thread-local values that the layer relies on are gone.
+/// A lookup of the layer's per-thread state that panicked there would abort the process.
 /// The global subscriber reaches the destructor without any thread-local dispatcher state.
 #[gtest]
 fn event_recorded_during_thread_teardown_is_written() -> Result<()> {

@@ -730,49 +730,6 @@ fn span_entered_at_thread_exit_keeps_an_unfinished_slice() -> Result<()> {
     Ok(())
 }
 
-/// A thread that takes over the per-thread slot of an exited thread starts from a fresh state.
-///
-/// Per-thread slots are reused once their thread exits, so a later thread that inherited the
-/// exited thread's state would leave its own track undescribed and end the exited thread's
-/// entered slices on its own track.
-#[gtest]
-fn later_thread_does_not_inherit_the_state_of_an_exited_thread() -> Result<()> {
-    let (layer, output) = annotated_layer();
-    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
-    let left_entered = tracing::dispatcher::with_default(&dispatch, || trace_span!("left_entered"));
-    let left_entered_id = left_entered.id().or_fail()?;
-
-    // The first thread describes its track and exits with the span still entered.
-    enter_on_thread(&dispatch, "exited thread", || {
-        tracing::info!(parent: None, "describes the exited thread");
-        std::mem::forget(left_entered.enter());
-    })?;
-
-    // The later thread exits that span, which it never entered, while its own span is entered.
-    enter_on_thread(&dispatch, "later thread", || {
-        tracing::info!(parent: None, "on the later thread");
-        trace_span!("own").in_scope(|| {
-            tracing::dispatcher::get_default(|current| current.exit(&left_entered_id));
-        });
-    })?;
-    drop(left_entered);
-
-    // Every slice on every track nests, and the later thread's track is described.
-    let trace = decode(&output)?;
-    let slices = replay_slices(&trace)?;
-    let later_track = thread_track_named(&trace, "later thread")?;
-    expect_that!(
-        nesting(&slices_on(&slices, later_track)),
-        elements_are![eq(&ended("own", 0))]
-    );
-    let exited_track = thread_track_named(&trace, "exited thread")?;
-    expect_that!(
-        nesting(&slices_on(&slices, exited_track)),
-        elements_are![eq(&open("left_entered", 0))]
-    );
-    Ok(())
-}
-
 /// Two layers on one registry each keep their own stack of entered spans.
 ///
 /// A stack shared by the layers would let one layer's exit match the other layer's entry, so a

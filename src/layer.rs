@@ -71,12 +71,13 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
     /// no process memory is sampled.
     #[must_use]
     pub fn new(writer: W) -> Self {
+        let layer_id = LayerId::next();
         Self {
-            layer_id: LayerId::next(),
+            layer_id,
             sequence: Arc::new(TraceSequence::new()),
             writer: Arc::new(writer),
             config: Config::default(),
-            threads: ThreadStates::default(),
+            threads: ThreadStates::new(layer_id),
             process_memory_rss_track_uuid: packets::unique_uuid(),
             lifecycle: Arc::default(),
         }
