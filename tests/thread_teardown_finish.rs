@@ -1,6 +1,6 @@
 //! A sampled trace finished during a thread's teardown, from a thread-local destructor and, on
 //! Unix, from a pthread key destructor, which on Linux runs after the standard library has
-//! destroyed the thread's handle.
+//! destroyed the thread's handle, also while the writer records into the layer as it is flushed.
 
 use googletest::prelude::*;
 use parking_lot::Mutex;
@@ -25,11 +25,29 @@ enum WriterCall {
     Flush,
 }
 
+/// What a [`TestWriter`] records while the layer flushes it.
+#[derive(Clone, Copy, Default)]
+enum OnFlush {
+    #[default]
+    Nothing,
+    /// An event, which reaches the layer through the global dispatcher.
+    #[cfg(unix)]
+    Event,
+    /// An entry into the span that the tearing-down thread recorded, which reaches the layer
+    /// through the span's own dispatcher.
+    #[cfg(unix)]
+    Entry,
+}
+
 /// A sink that a [`PerfettoLayer`] writes to, accumulating the trace and its calls in memory.
 #[derive(Clone, Default)]
 struct TestWriter {
     buf: Arc<Mutex<Vec<u8>>>,
     calls: Arc<Mutex<Vec<WriterCall>>>,
+    on_flush: OnFlush,
+    /// The span named [`SPAN_NAME`], which the writer holds open once the tearing-down thread
+    /// recorded it.
+    span: Arc<Mutex<Option<tracing::Span>>>,
 }
 
 impl<'a> MakeWriter<'a> for TestWriter {
@@ -48,6 +66,18 @@ impl std::io::Write for TestWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.calls.lock().push(WriterCall::Flush);
+        match self.on_flush {
+            OnFlush::Nothing => {}
+            #[cfg(unix)]
+            OnFlush::Event => tracing::info!(parent: None, flushing = true),
+            #[cfg(unix)]
+            OnFlush::Entry => {
+                let span = self.span.lock().clone();
+                if let Some(span) = span {
+                    span.in_scope(|| {});
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -72,9 +102,8 @@ struct SampledTrace {
     output: TestWriter,
 }
 
-/// Returns a trace whose sampler has written its first sample.
-fn sampled_trace() -> Result<SampledTrace> {
-    let writer = TestWriter::default();
+/// Returns a trace written to `writer`, whose sampler has written its first sample.
+fn sampled_trace(writer: TestWriter) -> Result<SampledTrace> {
     let output = writer.clone();
     let (announcements, announced) = mpsc::channel();
     let layer = PerfettoLayer::new(writer)
@@ -104,8 +133,12 @@ impl Finisher {
     }
 }
 
-/// Runs a thread that records [`SPAN_NAME`] into `trace`, hands `install` a [`Finisher`] that it
-/// arranges to run during the thread's teardown, and exits, and returns the finish's outcome.
+/// Runs a thread that records the span [`SPAN_NAME`] into `trace`, hands `install` a [`Finisher`]
+/// that it arranges to run during the thread's teardown, and exits, and returns the finish's
+/// outcome.
+///
+/// The thread neither enters the span nor records an event, so the layer keeps no state of the
+/// thread before its teardown, and the trace's writer holds the span open.
 fn finish_during_teardown(
     trace: &SampledTrace,
     install: impl FnOnce(Finisher) -> Result<()> + Send + 'static,
@@ -116,12 +149,13 @@ fn finish_during_teardown(
         outcome: Arc::clone(&outcome),
     };
     let dispatch = trace.dispatch.clone();
+    let span_slot = Arc::clone(&trace.output.span);
     std::thread::Builder::new()
         .name("tearing down".to_string())
         .spawn(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
-                tracing::info_span!(SPAN_NAME).in_scope(|| {});
-            });
+            let span =
+                tracing::dispatcher::with_default(&dispatch, || tracing::info_span!(SPAN_NAME));
+            *span_slot.lock() = Some(span);
             install(finisher)
         })
         .or_fail()?
@@ -173,7 +207,7 @@ thread_local! {
 /// still runs while `std::thread::current` works.
 #[gtest]
 fn a_thread_local_destructor_finishes_a_sampled_trace() -> Result<()> {
-    let trace = sampled_trace()?;
+    let trace = sampled_trace(TestWriter::default())?;
 
     let outcome = finish_during_teardown(&trace, |finisher| {
         FINISHES_ON_DROP.with(|slot| slot.borrow_mut().0 = Some(finisher));
@@ -188,7 +222,10 @@ fn a_thread_local_destructor_finishes_a_sampled_trace() -> Result<()> {
 /// destroyed the thread's handle.
 #[cfg(unix)]
 mod after_thread_handle {
-    use super::{Finisher, expect_complete, finish_during_teardown, sampled_trace};
+    use super::{
+        Finisher, OnFlush, SampledTrace, TestWriter, expect_complete, finish_during_teardown,
+        sampled_trace,
+    };
     use googletest::prelude::*;
     use std::ffi::c_void;
 
@@ -292,15 +329,59 @@ mod after_thread_handle {
     /// thread's identity through it to tell whether it is the sampler thread aborts the process.
     #[gtest]
     fn a_destructor_after_the_thread_handle_finishes_a_sampled_trace() -> Result<()> {
-        let trace = sampled_trace()?;
+        let trace = sampled_trace(TestWriter::default())?;
+        finish_from_a_late_destructor(&trace)
+    }
+
+    /// A sampled trace whose writer records an event while a destructor that runs after the
+    /// standard library destroyed the thread's handle flushes it is complete, and the finish
+    /// succeeds.
+    ///
+    /// The event reaches the layer through the global dispatcher, inside the flush, and is not
+    /// written.
+    /// The layer has not described the thread's track, so a layer that built the event's packets
+    /// anyway would look up the thread's name through `std::thread::current`, which panics from
+    /// then on and aborts the process.
+    #[gtest]
+    fn a_writer_that_records_an_event_while_a_late_destructor_flushes_it_leaves_a_complete_trace()
+    -> Result<()> {
+        let trace = sampled_trace(TestWriter {
+            on_flush: OnFlush::Event,
+            ..TestWriter::default()
+        })?;
+        tracing::dispatcher::set_global_default(trace.dispatch.clone()).or_fail()?;
+        finish_from_a_late_destructor(&trace)
+    }
+
+    /// A sampled trace whose writer enters a span while a destructor that runs after the
+    /// standard library destroyed the thread's handle flushes it is complete, and the finish
+    /// succeeds.
+    ///
+    /// The entry reaches the layer inside the flush, and its slice is not written.
+    /// The layer keeps no state of the thread yet, so it would record the entry and describe the
+    /// thread's track for the slice's begin, through `std::thread::current`, which panics from
+    /// then on and aborts the process.
+    #[gtest]
+    fn a_writer_that_enters_a_span_while_a_late_destructor_flushes_it_leaves_a_complete_trace()
+    -> Result<()> {
+        let trace = sampled_trace(TestWriter {
+            on_flush: OnFlush::Entry,
+            ..TestWriter::default()
+        })?;
+        finish_from_a_late_destructor(&trace)
+    }
+
+    /// Finishes `trace` from a destructor that runs after the standard library destroyed the
+    /// thread's handle, and expects the finish to succeed and the trace to be complete.
+    fn finish_from_a_late_destructor(trace: &SampledTrace) -> Result<()> {
         let key = std::sync::Arc::new(FinishingKey::create()?);
 
-        let outcome = finish_during_teardown(&trace, {
+        let outcome = finish_during_teardown(trace, {
             let key = std::sync::Arc::clone(&key);
             move |finisher| key.defer(finisher)
         })?;
 
         expect_that!(outcome, ok(eq(&())));
-        expect_complete(&trace)
+        expect_complete(trace)
     }
 }
