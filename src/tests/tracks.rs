@@ -320,6 +320,85 @@ fn event_in_a_filtered_out_span_entered_elsewhere_goes_to_the_thread_track() -> 
     Ok(())
 }
 
+/// Under a per-layer filter, an event in a filtered-out span goes on the track of the innermost
+/// recorded span entered on the thread, even when that span is unrelated to the filtered-out
+/// span.
+///
+/// The layer finds an event's span through the spans entered on the recording thread, skipping
+/// the ones it does not record, so it cannot tell an unrelated entered span from an ancestor.
+#[gtest]
+fn event_in_a_filtered_out_span_goes_to_the_innermost_entered_recorded_span() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
+
+    let root = trace_span!("root");
+    let filtered_out = trace_span!(parent: &root, "filtered_out");
+    trace_span!("unrelated").in_scope(|| {
+        filtered_out.in_scope(|| tracing::info!(marker = "in the filtered-out span"));
+    });
+    drop(filtered_out);
+    drop(root);
+
+    let trace = decode(&output)?;
+    expect_eq!(
+        instant_marked(&trace, "in the filtered-out span")?
+            .event
+            .track_uuid,
+        Some(span_track_named(&trace, "unrelated")?)
+    );
+    Ok(())
+}
+
+/// When no layer enables a filtered-out span's callsite, a span created inside a task that the
+/// filtered-out span instruments, polled on another thread, is a root.
+///
+/// The filtered-out span is `Span::none`, so entering it on the worker enters nothing, and the
+/// worker has no current span that the new span could nest under.
+#[gtest]
+fn child_in_a_task_instrumented_with_a_span_no_layer_enables_is_a_root() -> Result<()> {
+    let (layer, output) = annotated_layer();
+    let layer = layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out"));
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+
+    let root = tracing::dispatcher::with_default(&dispatch, || trace_span!("root"));
+    let task_span = root.in_scope(|| trace_span!("filtered_out"));
+    expect_true!(task_span.is_disabled());
+
+    // The worker polls a task instrumented with the filtered-out span.
+    let task = async { trace_span!("child").in_scope(|| {}) }.instrument(task_span);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let mut task = std::pin::pin!(task);
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    task.as_mut().poll(&mut context).is_ready()
+                })
+            })
+            .join()
+    })
+    .or_fail()
+    .and_then(|ready| verify_true!(ready))?;
+    drop(root);
+
+    let trace = decode(&output)?;
+    let process_track_uuid = trace
+        .packet
+        .iter()
+        .filter_map(track_descriptor)
+        .find(|descriptor| descriptor.process.is_some())
+        .map(idl::TrackDescriptor::uuid)
+        .or_fail()?;
+    let child_track = span_track_named(&trace, "child")?;
+    let child_descriptor = span_track_descriptors(&trace)
+        .into_iter()
+        .find(|descriptor| descriptor.uuid() == child_track)
+        .or_fail()?;
+    expect_eq!(child_descriptor.parent_uuid, Some(process_track_uuid));
+    expect_ne!(child_track, span_track_named(&trace, "root")?);
+    Ok(())
+}
+
 /// When no layer enables a filtered-out span's callsite, the span does not exist, so a span
 /// that names it as its explicit parent is a root with a track of its own.
 ///

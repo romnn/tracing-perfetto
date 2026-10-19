@@ -51,15 +51,22 @@
 //! The layer records every span and event that reaches it.
 //! To record only some, give it a [per-layer filter], which leaves the other layers of the
 //! registry unaffected.
-//! A span that the filter rejects has no slices:
+//! A span that the filter rejects has no slices, and the layer does not see it:
 //!
 //! - Its recorded children nest on the track of its nearest recorded ancestor.
-//! - Its events reach that ancestor's track only while the ancestor is entered on the recording
-//!   thread, as when the rejected span is entered inside it.
-//!   An event that names the rejected span as its explicit parent, or that a task instrumented
-//!   with the rejected span records on another thread, goes on the thread's track ([#11]).
-//! - If no layer of the registry enables the rejected span's callsite, the span does not exist,
-//!   so a span that names it as its explicit parent becomes a root.
+//! - An event inside it goes on the track of the innermost recorded span entered on the
+//!   recording thread, or else on the thread's track.
+//!   That span is the nearest recorded ancestor when the rejected span is entered directly inside
+//!   it, but it can be an unrelated span that happens to be entered.
+//! - An event that names the rejected span as its explicit parent goes on the thread's track.
+//!
+//! If no layer of the registry enables the rejected span's callsite, as with a single filtered
+//! layer, the span is [`Span::none`](tracing::Span::none).
+//! A span created inside a task that it instruments on another thread, and a span that names it
+//! as its explicit parent, then become roots.
+//! Another layer that enables every callsite keeps the rejected span in the registry and with it
+//! the nesting, at the cost of creating every span.
+//! Issue [#11] tracks routing the events of a rejected span to its nearest recorded ancestor.
 //!
 //! A filter can select by target or level, or by a field that marks the spans and events to
 //! record:
