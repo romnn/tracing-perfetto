@@ -70,11 +70,8 @@ fn sequence_id(packet: &idl::TracePacket) -> Option<u32> {
 
 /// The builtin clocks that the clock snapshot pairs with the sequence clock, in snapshot order.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const SNAPSHOT_BUILTIN_CLOCKS: [idl::BuiltinClock; 3] = [
-    idl::BuiltinClock::Boottime,
-    idl::BuiltinClock::Monotonic,
-    idl::BuiltinClock::Realtime,
-];
+const SNAPSHOT_BUILTIN_CLOCKS: [idl::BuiltinClock; 2] =
+    [idl::BuiltinClock::Boottime, idl::BuiltinClock::Realtime];
 /// The builtin clocks that the clock snapshot pairs with the sequence clock, in snapshot order.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const SNAPSHOT_BUILTIN_CLOCKS: [idl::BuiltinClock; 1] = [idl::BuiltinClock::Realtime];
@@ -780,55 +777,64 @@ fn snapshot_timestamp(snapshot: &idl::ClockSnapshot, clock: idl::BuiltinClock) -
         .and_then(|snapshot_clock| snapshot_clock.timestamp)
 }
 
-/// The clock snapshot reads boot time and monotonic time when the layer first writes, and pins
-/// the sequence clock's epoch on monotonic time.
+/// The sequence clock counts boot time from the layer's epoch, and the clock snapshot pairs it
+/// with the boot time it was read from when the layer first writes.
 ///
-/// A system trace that `traced` records on Linux or Android is timestamped in boot time, so
-/// trace processor aligns the layer's slices with it exactly only through a boot time reading
-/// taken back to back with the sequence clock, not through the wall clock, which NTP adjusts.
+/// A system trace that `traced` records on Linux or Android is timestamped in boot time, which
+/// keeps counting while the system is suspended.
+/// Trace processor aligns the layer's slices with it exactly, even after a suspend, only if the
+/// sequence clock is boot time too and the snapshot pairs the two from a single reading.
+/// The snapshot reads no monotonic time, whose offset from boot time goes stale at the next
+/// suspend and would compete with the offset in the system trace's own snapshots.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[gtest]
-fn clock_snapshot_reads_boot_and_monotonic_time_at_the_first_write() -> Result<()> {
+fn sequence_clock_counts_boot_time_from_the_epoch_that_the_snapshot_pins() -> Result<()> {
     use rustix::time::ClockId;
 
     let writer = TestWriter::new();
     let extra_writer = writer.make_writer();
-    // The layer starts its sequence clock after this reading.
-    let monotonic_before_layer = kernel_clock_nanos(ClockId::Monotonic)?;
+    // The layer reads its epoch between this reading and the next one.
+    let boottime_before_layer = kernel_clock_nanos(ClockId::Boottime)?;
     let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    // The first write emits the preamble, so its snapshot reads every clock between these
-    // readings.
+    // The first write emits the preamble and the event, so the snapshot and the event's
+    // timestamp both read boot time between these readings.
     let boottime_before = kernel_clock_nanos(ClockId::Boottime)?;
-    let monotonic_before = kernel_clock_nanos(ClockId::Monotonic)?;
     tracing::info!("first");
     let boottime_after = kernel_clock_nanos(ClockId::Boottime)?;
-    let monotonic_after = kernel_clock_nanos(ClockId::Monotonic)?;
 
     let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
     let snapshot = preamble_snapshot(&trace).or_fail()?;
-    let boottime = snapshot_timestamp(snapshot, idl::BuiltinClock::Boottime);
-    let monotonic = snapshot_timestamp(snapshot, idl::BuiltinClock::Monotonic);
+    let boottime = snapshot_timestamp(snapshot, idl::BuiltinClock::Boottime).or_fail()?;
+    expect_that!(boottime, all![ge(boottime_before), le(boottime_after)]);
     expect_that!(
-        boottime,
-        some(all![ge(boottime_before), le(boottime_after)])
-    );
-    expect_that!(
-        monotonic,
-        some(all![ge(monotonic_before), le(monotonic_after)])
+        snapshot_timestamp(snapshot, idl::BuiltinClock::Monotonic),
+        none()
     );
 
-    // `Instant` reads monotonic time on Linux and Android, so subtracting the sequence clock
-    // from the monotonic reading yields the epoch plus the short gap between the two readings.
+    // Boot time minus the sequence clock is the epoch, which the layer read before the first
+    // write.
     let sequence = snapshot
         .clocks
         .iter()
         .find(|clock| clock.clock_id == Some(SEQUENCE_CLOCK_ID))
         .and_then(|clock| clock.timestamp)
         .or_fail()?;
-    let epoch = monotonic.or_fail()?.checked_sub(sequence).or_fail()?;
-    expect_that!(epoch, all![ge(monotonic_before_layer), le(monotonic_after)]);
+    let epoch = boottime.checked_sub(sequence).or_fail()?;
+    expect_that!(epoch, all![ge(boottime_before_layer), le(boottime_before)]);
+
+    // The event's timestamp converts through that epoch to the boot time at which it was
+    // recorded.
+    let event_timestamp = trace
+        .packet
+        .iter()
+        .find_map(|packet| packet.timestamp)
+        .or_fail()?;
+    expect_that!(
+        epoch.checked_add(event_timestamp),
+        some(all![ge(boottime_before), le(boottime_after)])
+    );
     Ok(())
 }
 
