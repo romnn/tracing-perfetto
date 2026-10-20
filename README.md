@@ -196,11 +196,61 @@ panic unwinds is caught, since a second panic there aborts the process.
   of a `Mutex<BufWriter<File>>`, or anything else the writer or the process-memory source needs,
   because both wait for the write in progress and then flush the writer themselves.
 
+## System traces
+
+On Linux and Android, a system trace that Perfetto's `traced` records, with kernel scheduling,
+CPU frequency and other processes, merges with the layer's trace.
+The layer's clock snapshot reads boot time, which the system trace is timestamped in, and the
+monotonic and wall clocks, back to back with the clock that the layer timestamps with.
+Boot time is the trace clock, so trace processor places the app's slices among the scheduler
+data exactly, whichever trace comes first, and never through the wall clock, which NTP steps and
+slews.
+
+Record the system trace while the app writes its own, then concatenate the two and open the
+result in the Perfetto UI:
+
+```bash
+# Kernel tracing needs access to tracefs, usually as root.
+sudo tracebox -o system.pftrace --txt -c system.cfg &
+# The app writes app.pftrace while the system trace records.
+./my-app
+wait
+cat app.pftrace system.pftrace > merged.pftrace
+```
+
+With `traced` already running, `perfetto --txt -c system.cfg -o system.pftrace` records the
+same.
+A minimal `system.cfg` that records scheduling and CPU frequency for ten seconds:
+
+```text
+buffers { size_kb: 65536 }
+data_sources {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "power/cpu_frequency"
+    }
+  }
+}
+data_sources { config { name: "linux.process_stats" } }
+duration_ms: 10000
+```
+
+Timestamps in trace processor are boot-time nanoseconds on Linux and Android, and wall-clock
+nanoseconds elsewhere.
+The Perfetto UI shows wall-clock time either way, through the wall-clock reading of the
+snapshot.
+
 ## Known limitations
 
 - With tracing-subscriber 0.3.23, a child span that closes on a thread whose default dispatcher
   is another one leaves its parent's lifetime slice without an end, or panics (see
   [Installing](#installing), [#9]).
+- The layer reads its clock snapshot once, when it first writes, and timestamps with the
+  monotonic clock, which stops while the system is suspended.
+  After a suspend during the trace, the app's slices land earlier than the system trace's data
+  by the time the system slept.
 
 [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 [tokio-rs/tracing#2870]: https://github.com/tokio-rs/tracing/issues/2870

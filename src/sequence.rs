@@ -9,6 +9,20 @@ use std::time::{Duration, Instant, SystemTime};
 /// defines its own clock without colliding with another layer's.
 pub(crate) const SEQUENCE_CLOCK_ID: u32 = 64;
 
+/// The clock that trace processor converts every timestamp to.
+///
+/// A system trace that `traced` records on Linux or Android is timestamped in boot time.
+/// Trace processor keeps the trace clock of whichever trace in a concatenated file declares it
+/// first, so declaring boot time here aligns the layer's slices with such a trace exactly in
+/// either order, and never through the wall clock, which NTP steps and slews.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TRACE_CLOCK: idl::BuiltinClock = idl::BuiltinClock::Boottime;
+/// The clock that trace processor converts every timestamp to.
+///
+/// No boot time reading is available here, so the wall clock is the trace clock.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const TRACE_CLOCK: idl::BuiltinClock = idl::BuiltinClock::Realtime;
+
 /// The packet sequence shared by a layer and its process-memory sampler.
 ///
 /// Every packet that reads [`SEQUENCE_CLOCK_ID`] must follow the preamble that defines it, so
@@ -76,30 +90,39 @@ impl TraceSequence {
     /// Builds the process track descriptor and the clock snapshot that defines
     /// [`SEQUENCE_CLOCK_ID`].
     ///
-    /// The snapshot pairs the sequence clock with the wall clock and makes the wall clock the trace
-    /// clock, so trace processor keeps the monotonic ordering and displays wall-clock time.
+    /// The snapshot pairs the sequence clock with the wall clock and, on Linux and Android, with
+    /// boot time and monotonic time.
+    /// It makes [`TRACE_CLOCK`] the trace clock, so trace processor keeps the monotonic ordering.
+    /// The Perfetto UI shows wall-clock time through the snapshot's wall-clock reading whichever
+    /// clock is the trace clock.
     pub(crate) fn preamble_trace(&self) -> idl::Trace {
-        // Read both clocks back to back so that the snapshot pins their offset.
-        let sequence_timestamp = self.now();
+        // Read all clocks back to back so that the snapshot pins their offsets.
+        let sequence_clock = snapshot_clock(Some(SEQUENCE_CLOCK_ID), self.now());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let kernel_clocks = [
+            kernel_clock(idl::BuiltinClock::Boottime, rustix::time::ClockId::Boottime),
+            kernel_clock(
+                idl::BuiltinClock::Monotonic,
+                rustix::time::ClockId::Monotonic,
+            ),
+        ];
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let kernel_clocks = [];
         let realtime_timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, duration_nanos);
+        let realtime_clock = snapshot_clock(
+            builtin_clock_id(idl::BuiltinClock::Realtime),
+            realtime_timestamp,
+        );
 
-        let realtime_clock = idl::BuiltinClock::Realtime;
         let clock_snapshot = idl::ClockSnapshot {
-            clocks: vec![
-                idl::clock_snapshot::Clock {
-                    clock_id: Some(SEQUENCE_CLOCK_ID),
-                    timestamp: Some(sequence_timestamp),
-                    ..Default::default()
-                },
-                idl::clock_snapshot::Clock {
-                    clock_id: u32::try_from(i32::from(realtime_clock)).ok(),
-                    timestamp: Some(realtime_timestamp),
-                    ..Default::default()
-                },
-            ],
-            primary_trace_clock: Some(realtime_clock.into()),
+            clocks: [sequence_clock]
+                .into_iter()
+                .chain(kernel_clocks)
+                .chain([realtime_clock])
+                .collect(),
+            primary_trace_clock: Some(TRACE_CLOCK.into()),
         };
 
         idl::Trace {
@@ -117,4 +140,25 @@ impl TraceSequence {
 /// Returns `duration` in nanoseconds, saturating at [`u64::MAX`] after about 584 years.
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Returns a snapshot entry that reads `timestamp` on `clock_id`.
+fn snapshot_clock(clock_id: Option<u32>, timestamp: u64) -> idl::clock_snapshot::Clock {
+    idl::clock_snapshot::Clock {
+        clock_id,
+        timestamp: Some(timestamp),
+        ..Default::default()
+    }
+}
+
+/// Returns the snapshot ID of a builtin clock.
+fn builtin_clock_id(clock: idl::BuiltinClock) -> Option<u32> {
+    u32::try_from(i32::from(clock)).ok()
+}
+
+/// Returns a snapshot entry that reads the kernel clock `id` now as the builtin clock `clock`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kernel_clock(clock: idl::BuiltinClock, id: rustix::time::ClockId) -> idl::clock_snapshot::Clock {
+    let timestamp = Duration::try_from(rustix::time::clock_gettime(id)).map_or(0, duration_nanos);
+    snapshot_clock(builtin_clock_id(clock), timestamp)
 }

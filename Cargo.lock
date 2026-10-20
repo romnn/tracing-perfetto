@@ -648,6 +648,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "rand",
+ "rustix",
  "thread-id",
  "tokio",
  "tracing",

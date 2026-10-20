@@ -68,10 +68,41 @@ fn sequence_id(packet: &idl::TracePacket) -> Option<u32> {
     Some(id)
 }
 
+/// The builtin clocks that the clock snapshot pairs with the sequence clock, in snapshot order.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SNAPSHOT_BUILTIN_CLOCKS: [idl::BuiltinClock; 3] = [
+    idl::BuiltinClock::Boottime,
+    idl::BuiltinClock::Monotonic,
+    idl::BuiltinClock::Realtime,
+];
+/// The builtin clocks that the clock snapshot pairs with the sequence clock, in snapshot order.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SNAPSHOT_BUILTIN_CLOCKS: [idl::BuiltinClock; 1] = [idl::BuiltinClock::Realtime];
+
+/// The trace clock that the clock snapshot declares: boot time, which a system trace recorded
+/// on Linux or Android uses too.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EXPECTED_TRACE_CLOCK: idl::BuiltinClock = idl::BuiltinClock::Boottime;
+/// The trace clock that the clock snapshot declares: the wall clock.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const EXPECTED_TRACE_CLOCK: idl::BuiltinClock = idl::BuiltinClock::Realtime;
+
+/// Returns the snapshot clock ID of a builtin clock.
+fn builtin_clock_id(clock: idl::BuiltinClock) -> Option<u32> {
+    u32::try_from(i32::from(clock)).ok()
+}
+
+/// Returns the clock IDs that the clock snapshot reads, in snapshot order.
+fn expected_snapshot_clock_ids() -> Vec<Option<u32>> {
+    std::iter::once(Some(SEQUENCE_CLOCK_ID))
+        .chain(SNAPSHOT_BUILTIN_CLOCKS.map(builtin_clock_id))
+        .collect()
+}
+
 /// Checks that `trace` opens with its preamble and never repeats it.
 ///
 /// The preamble is the process track descriptor followed by the clock snapshot that maps the
-/// sequence clock onto the wall clock.
+/// sequence clock onto the builtin clocks.
 fn expect_preamble_once(trace: &idl::Trace) -> Result<()> {
     let [descriptor, snapshot, ..] = trace.packet.as_slice() else {
         return fail!("expected a preamble, got {} packets", trace.packet.len());
@@ -81,20 +112,16 @@ fn expect_preamble_once(trace: &idl::Trace) -> Result<()> {
         return fail!("expected a clock snapshot after the process descriptor");
     };
 
-    // The snapshot pairs the sequence clock with the wall clock, which is the trace clock.
-    let realtime_clock_id = u32::try_from(i32::from(idl::BuiltinClock::Realtime)).or_fail()?;
+    // The snapshot pairs the sequence clock with the builtin clocks and declares the trace clock.
     let clock_ids: Vec<_> = snapshot_data
         .clocks
         .iter()
         .map(|clock| clock.clock_id)
         .collect();
-    expect_eq!(
-        clock_ids,
-        vec![Some(SEQUENCE_CLOCK_ID), Some(realtime_clock_id)]
-    );
+    expect_eq!(clock_ids, expected_snapshot_clock_ids());
     expect_eq!(
         snapshot_data.primary_trace_clock,
-        Some(i32::from(idl::BuiltinClock::Realtime))
+        Some(i32::from(EXPECTED_TRACE_CLOCK))
     );
     // The user-defined clock is scoped to the snapshot's sequence.
     expect_true!(sequence_id(snapshot).is_some());
@@ -651,10 +678,10 @@ fn two_layers_on_one_registry_each_write_a_complete_trace() -> Result<()> {
 }
 
 /// Every timestamped packet reads the sequence clock that one earlier snapshot maps onto the
-/// wall clock.
+/// builtin clocks.
 ///
-/// A packet without a clock ID is read as boot time, so elapsed nanoseconds since the layer's
-/// epoch would land decades before the snapshot's wall-clock time.
+/// A packet without a clock ID is read on the trace clock, so elapsed nanoseconds since the
+/// layer's epoch would land days or decades before the snapshot's reading of it.
 #[gtest]
 fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
     let writer = TestWriter::new();
@@ -695,21 +722,17 @@ fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
         .or_fail()?;
     expect_that!(snapshot_position, lt(first_timestamped_position));
 
-    // The snapshot pairs the sequence clock with the wall clock on the packets' sequence.
+    // The snapshot pairs the sequence clock with the builtin clocks on the packets' sequence.
     let snapshot = trace.packet.get(snapshot_position).or_fail()?;
     let Some(idl::trace_packet::Data::ClockSnapshot(snapshot_data)) = &snapshot.data else {
         return fail!("expected a clock snapshot at {snapshot_position}");
     };
-    let realtime_clock_id = u32::try_from(i32::from(idl::BuiltinClock::Realtime)).or_fail()?;
     let clock_ids: Vec<_> = snapshot_data
         .clocks
         .iter()
         .map(|clock| clock.clock_id)
         .collect();
-    expect_eq!(
-        clock_ids,
-        vec![Some(SEQUENCE_CLOCK_ID), Some(realtime_clock_id)]
-    );
+    expect_eq!(clock_ids, expected_snapshot_clock_ids());
     expect_that!(
         snapshot_data
             .clocks
@@ -720,7 +743,7 @@ fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
     );
     expect_eq!(
         snapshot_data.primary_trace_clock,
-        Some(i32::from(idl::BuiltinClock::Realtime))
+        Some(i32::from(EXPECTED_TRACE_CLOCK))
     );
     let first_timestamped = trace.packet.get(first_timestamped_position).or_fail()?;
     expect_eq!(sequence_id(snapshot), sequence_id(first_timestamped));
@@ -728,6 +751,84 @@ fn timestamped_packets_read_the_clock_of_one_earlier_snapshot() -> Result<()> {
     // Every timestamped packet, span, event and sample alike, reads that clock.
     expect_sequence_clock(&trace);
     expect_true!(trace.packet.iter().any(is_counter_event));
+    Ok(())
+}
+
+/// Returns the current time on the kernel clock `id`, in nanoseconds.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kernel_clock_nanos(id: rustix::time::ClockId) -> Result<u64> {
+    let duration = std::time::Duration::try_from(rustix::time::clock_gettime(id)).or_fail()?;
+    u64::try_from(duration.as_nanos()).or_fail()
+}
+
+/// Returns the clock snapshot that a trace's preamble holds as its second packet.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn preamble_snapshot(trace: &idl::Trace) -> Option<&idl::ClockSnapshot> {
+    match &trace.packet.get(1)?.data {
+        Some(idl::trace_packet::Data::ClockSnapshot(snapshot)) => Some(snapshot),
+        _ => None,
+    }
+}
+
+/// Returns the timestamp that `snapshot` reads on the builtin clock `clock`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn snapshot_timestamp(snapshot: &idl::ClockSnapshot, clock: idl::BuiltinClock) -> Option<u64> {
+    snapshot
+        .clocks
+        .iter()
+        .find(|snapshot_clock| snapshot_clock.clock_id == builtin_clock_id(clock))
+        .and_then(|snapshot_clock| snapshot_clock.timestamp)
+}
+
+/// The clock snapshot reads boot time and monotonic time when the layer first writes, and pins
+/// the sequence clock's epoch on monotonic time.
+///
+/// A system trace that `traced` records on Linux or Android is timestamped in boot time, so
+/// trace processor aligns the layer's slices with it exactly only through a boot time reading
+/// taken back to back with the sequence clock, not through the wall clock, which NTP adjusts.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[gtest]
+fn clock_snapshot_reads_boot_and_monotonic_time_at_the_first_write() -> Result<()> {
+    use rustix::time::ClockId;
+
+    let writer = TestWriter::new();
+    let extra_writer = writer.make_writer();
+    // The layer starts its sequence clock after this reading.
+    let monotonic_before_layer = kernel_clock_nanos(ClockId::Monotonic)?;
+    let subscriber = tracing_subscriber::registry().with(PerfettoLayer::new(writer));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // The first write emits the preamble, so its snapshot reads every clock between these
+    // readings.
+    let boottime_before = kernel_clock_nanos(ClockId::Boottime)?;
+    let monotonic_before = kernel_clock_nanos(ClockId::Monotonic)?;
+    tracing::info!("first");
+    let boottime_after = kernel_clock_nanos(ClockId::Boottime)?;
+    let monotonic_after = kernel_clock_nanos(ClockId::Monotonic)?;
+
+    let trace = idl::Trace::decode(extra_writer.buf.lock().as_slice()).or_fail()?;
+    let snapshot = preamble_snapshot(&trace).or_fail()?;
+    let boottime = snapshot_timestamp(snapshot, idl::BuiltinClock::Boottime);
+    let monotonic = snapshot_timestamp(snapshot, idl::BuiltinClock::Monotonic);
+    expect_that!(
+        boottime,
+        some(all![ge(boottime_before), le(boottime_after)])
+    );
+    expect_that!(
+        monotonic,
+        some(all![ge(monotonic_before), le(monotonic_after)])
+    );
+
+    // `Instant` reads monotonic time on Linux and Android, so subtracting the sequence clock
+    // from the monotonic reading yields the epoch plus the short gap between the two readings.
+    let sequence = snapshot
+        .clocks
+        .iter()
+        .find(|clock| clock.clock_id == Some(SEQUENCE_CLOCK_ID))
+        .and_then(|clock| clock.timestamp)
+        .or_fail()?;
+    let epoch = monotonic.or_fail()?.checked_sub(sequence).or_fail()?;
+    expect_that!(epoch, all![ge(monotonic_before_layer), le(monotonic_after)]);
     Ok(())
 }
 
