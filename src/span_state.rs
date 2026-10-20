@@ -236,6 +236,24 @@ where
     SpanPlacement::new_track(process_track_uuid, span.name())
 }
 
+/// Returns the lifetime track of the nearest span that the layer `layer_id` records, among
+/// `span` and its ancestors.
+///
+/// Only spans that the layer records hold its state, so `span` may come from a lookup that sees
+/// the spans its filter rejected as well.
+pub(crate) fn nearest_lifetime_track<R>(span: &SpanRef<'_, R>, layer_id: LayerId) -> Option<u64>
+where
+    R: for<'a> LookupSpan<'a>,
+{
+    span.scope().find_map(|span| {
+        span.extensions()
+            .get::<SpanStates>()
+            .and_then(|states| states.get(layer_id))
+            .and_then(SpanState::lifetime)
+            .map(|lifetime| lifetime.track_uuid)
+    })
+}
+
 /// The span states of every [`PerfettoLayer`](crate::PerfettoLayer) on a registry, stored as one
 /// span extension.
 ///

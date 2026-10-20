@@ -233,14 +233,13 @@ fn child_of_a_filtered_out_span_nests_on_its_nearest_recorded_ancestor() -> Resu
     Ok(())
 }
 
-/// Under a per-layer filter, an event whose explicit parent is a filtered-out span is an
-/// instant on the thread's track, even inside a recorded span.
+/// Under a per-layer filter, an event whose explicit parent is a filtered-out span is an instant
+/// on the track of that span's nearest recorded ancestor, even inside another recorded span.
 ///
-/// The layer cannot see a filtered-out span, so it cannot reach that span's recorded
-/// ancestors, and routing the event by the current span instead would place it under a span it
-/// does not belong to.
+/// The layer's filtered context hides the filtered-out span, so an event routed through that
+/// context alone would land on the thread's track, away from the span it belongs to.
 #[gtest]
-fn event_with_a_filtered_out_explicit_parent_goes_to_the_thread_track() -> Result<()> {
+fn event_with_a_filtered_out_explicit_parent_goes_to_its_nearest_recorded_ancestor() -> Result<()> {
     let (layer, output) = annotated_layer();
     let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
 
@@ -253,25 +252,51 @@ fn event_with_a_filtered_out_explicit_parent_goes_to_the_thread_track() -> Resul
     drop(root);
 
     let trace = decode(&output)?;
-    let [thread_track] = thread_track_uuids(&trace)[..] else {
-        return fail!("expected one thread track");
-    };
     expect_eq!(
         instant_marked(&trace, "explicit parent")?.event.track_uuid,
-        Some(thread_track)
+        Some(span_track_named(&trace, "root")?)
     );
     Ok(())
 }
 
-/// Under a per-layer filter, an event in a filtered-out span that is entered outside its
-/// recorded ancestor, as a spawned task's span is on a worker thread, is an instant on the
-/// thread's track.
+/// Under a per-layer filter, a span whose explicit parent is a filtered-out span nests on the
+/// track of that span's nearest recorded ancestor, not on the span entered around its creation.
 ///
-/// Events reach a recorded ancestor through the spans entered on the recording thread, so a
-/// recorded ancestor that is not entered there is out of reach, and a recorded child of the
-/// filtered-out span still nests on that ancestor.
+/// A child that nested on the entered span would sit under a span it does not belong to, and one
+/// that saw no recorded parent would become a root on a track of its own.
 #[gtest]
-fn event_in_a_filtered_out_span_entered_elsewhere_goes_to_the_thread_track() -> Result<()> {
+fn child_with_a_filtered_out_explicit_parent_nests_on_its_nearest_recorded_ancestor() -> Result<()>
+{
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
+
+    let root = trace_span!("root");
+    let filtered_out = trace_span!(parent: &root, "filtered_out");
+    trace_span!("unrelated").in_scope(|| {
+        trace_span!(parent: &filtered_out, "child").in_scope(|| {});
+    });
+    drop(filtered_out);
+    drop(root);
+
+    // The child nests on the root's track, directly below the root's slice.
+    let trace = decode(&output)?;
+    let slices = replay_lifetime_slices(&trace)?;
+    let child = slice_named(&slices, "child")?;
+    expect_eq!(child.track_uuid, span_track_named(&trace, "root")?);
+    expect_eq!(child.depth, 1);
+    Ok(())
+}
+
+/// Under a per-layer filter, an event in a filtered-out span that is entered outside its
+/// recorded ancestor, as a spawned task's span is on a worker thread, is an instant on that
+/// ancestor's track.
+///
+/// The worker has no recorded span entered, so an event routed through the spans entered there
+/// would land on the worker's thread track, while a recorded child of the filtered-out span
+/// nests on the ancestor.
+#[gtest]
+fn event_in_a_filtered_out_span_entered_on_another_thread_goes_to_its_nearest_recorded_ancestor()
+-> Result<()> {
     let (layer, output) = annotated_layer();
     let dispatch = tracing::Dispatch::new(filtering_out_one_span(layer));
     let (root, filtered_out) = tracing::dispatcher::with_default(&dispatch, || {
@@ -299,35 +324,64 @@ fn event_in_a_filtered_out_span_entered_elsewhere_goes_to_the_thread_track() -> 
     drop(filtered_out);
     drop(root);
 
+    // Both the event and the child created inside the filtered-out span are on the root's track.
     let trace = decode(&output)?;
-    let worker_track = trace
-        .packet
-        .iter()
-        .filter_map(track_descriptor)
-        .find(|descriptor| descriptor.thread.is_some() && track_name(descriptor) == Some("worker"))
-        .map(idl::TrackDescriptor::uuid)
-        .or_fail()?;
+    let root_track = span_track_named(&trace, "root")?;
     expect_eq!(
         instant_marked(&trace, "on the worker")?.event.track_uuid,
-        Some(worker_track)
+        Some(root_track)
     );
-
-    // The child created inside the filtered-out span nests on the root's track.
-    let root_track = span_track_named(&trace, "root")?;
     let slices = replay_lifetime_slices(&trace)?;
     expect_eq!(slice_named(&slices, "child")?.track_uuid, root_track);
     expect_eq!(slice_named(&slices, "child")?.depth, 1);
     Ok(())
 }
 
-/// Under a per-layer filter, an event in a filtered-out span goes on the track of the innermost
-/// recorded span entered on the thread, even when that span is unrelated to the filtered-out
-/// span.
+/// Under a per-layer filter, an event in a Tokio task instrumented with a filtered-out span is an
+/// instant on the track of the recorded span that spawned the task.
 ///
-/// The layer finds an event's span through the spans entered on the recording thread, skipping
-/// the ones it does not record, so it cannot tell an unrelated entered span from an ancestor.
+/// The runtime polls the task after the spawning span has exited, so no recorded span is
+/// entered while the event is recorded, and routing through the entered spans would put the
+/// event on the thread's track.
 #[gtest]
-fn event_in_a_filtered_out_span_goes_to_the_innermost_entered_recorded_span() -> Result<()> {
+fn event_in_a_task_instrumented_with_a_filtered_out_span_goes_to_its_nearest_recorded_ancestor()
+-> Result<()> {
+    let (layer, output) = annotated_layer();
+    let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .or_fail()?;
+
+    // The current-thread runtime polls the task only once `block_on` awaits it, after the root
+    // has exited.
+    let root = trace_span!("root");
+    runtime.block_on(async {
+        let task = root.in_scope(|| {
+            tokio::spawn(
+                async { tracing::info!(marker = "in the task") }
+                    .instrument(trace_span!("filtered_out")),
+            )
+        });
+        task.await.or_fail()
+    })?;
+    drop(runtime);
+    drop(root);
+
+    let trace = decode(&output)?;
+    expect_eq!(
+        instant_marked(&trace, "in the task")?.event.track_uuid,
+        Some(span_track_named(&trace, "root")?)
+    );
+    Ok(())
+}
+
+/// Under a per-layer filter, an event in a filtered-out span is an instant on the track of that
+/// span's nearest recorded ancestor, even when an unrelated recorded span is entered below it.
+///
+/// Routing through the spans entered on the thread would find the unrelated span first and put
+/// the event under a span it does not belong to.
+#[gtest]
+fn event_in_a_filtered_out_span_skips_an_unrelated_entered_span() -> Result<()> {
     let (layer, output) = annotated_layer();
     let _guard = tracing::subscriber::set_default(filtering_out_one_span(layer));
 
@@ -344,7 +398,49 @@ fn event_in_a_filtered_out_span_goes_to_the_innermost_entered_recorded_span() ->
         instant_marked(&trace, "in the filtered-out span")?
             .event
             .track_uuid,
+        Some(span_track_named(&trace, "root")?)
+    );
+    Ok(())
+}
+
+/// Under a per-layer filter on a layer inside an `Option`, an event in a filtered-out span goes
+/// on the track of the innermost recorded span entered on the thread, and one that names the
+/// filtered-out span as its explicit parent on the thread's track.
+///
+/// The `Option` layer does not pass the dispatcher on to the layer, so the layer cannot look up
+/// the filtered-out span, and routes by the spans that its filtered context shows.
+#[gtest]
+fn event_in_a_filtered_out_span_of_an_optional_layer_goes_to_the_innermost_entered_span()
+-> Result<()> {
+    let (layer, output) = annotated_layer();
+    let layer = Some(layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out")));
+    let every_span = tracing_subscriber::fmt::layer().with_writer(std::io::sink);
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(layer).with(every_span),
+    );
+
+    let root = trace_span!("root");
+    let filtered_out = trace_span!(parent: &root, "filtered_out");
+    trace_span!("unrelated").in_scope(|| {
+        filtered_out.in_scope(|| tracing::info!(marker = "in the filtered-out span"));
+        tracing::info!(parent: &filtered_out, marker = "explicit parent");
+    });
+    drop(filtered_out);
+    drop(root);
+
+    let trace = decode(&output)?;
+    let [thread_track] = thread_track_uuids(&trace)[..] else {
+        return fail!("expected one thread track");
+    };
+    expect_eq!(
+        instant_marked(&trace, "in the filtered-out span")?
+            .event
+            .track_uuid,
         Some(span_track_named(&trace, "unrelated")?)
+    );
+    expect_eq!(
+        instant_marked(&trace, "explicit parent")?.event.track_uuid,
+        Some(thread_track)
     );
     Ok(())
 }

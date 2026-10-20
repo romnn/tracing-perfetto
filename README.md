@@ -142,33 +142,38 @@ let layer = PerfettoLayer::new(writer).with_filter(tracing_subscriber::filter::f
 
 A field filter reads the callsite's metadata, so it also selects spans that declare the field
 without a value, as `#[instrument(fields(perfetto))]` does.
-A span that the filter rejects has no slices, and the layer does not see it:
+A span that the filter rejects has no slices, and what belongs to it goes on the track of its
+nearest recorded ancestor, whichever spans are entered on the recording thread:
 
-- Its recorded children nest on the track of its nearest recorded ancestor.
-- An event inside it goes on the track of the innermost recorded span entered on the recording
-  thread, or else on the thread's track.
-  That span is the nearest recorded ancestor when the rejected span is entered directly inside
-  it, but it can be an unrelated span that happens to be entered.
-- An event that names the rejected span as its explicit parent goes on the thread's track.
+- Its recorded children nest on that ancestor's track.
+- An event inside it, or one that names it as its explicit parent, is an instant on that
+  ancestor's track, or on the thread's track when it has no recorded ancestor.
 
+That holds while the rejected span exists in the registry.
 When its callsite's interest is `never`, the rejected span is `Span::none`, and tracing caches
 that interest once per callsite for every dispatcher of the process.
 That is the case for a filter that decides by metadata alone, such as `filter_fn` above or a level
 filter, when no layer of the registry and no other dispatcher in the process enables the callsite.
 A span created inside a task that it instruments on another thread, and a span that names it as
 its explicit parent, then become roots.
+An event that names it as its explicit parent then goes on the thread's track, and an event inside
+it belongs to the span entered around it, if any.
 
 With tracing-subscriber 0.3.23, a span that only per-layer filters reject at runtime, under
-`sometimes` interest, still exists in the registry, so its children nest on its nearest recorded
-ancestor.
+`sometimes` interest, still exists in the registry, so what belongs to it goes on its nearest
+recorded ancestor's track.
 That happens with a filter that reads the context, such as `dynamic_filter_fn`, and when another
 dispatcher in the process enables the callsite, such as the subscriber of another test in the same
 test binary.
 The cached interest is rebuilt when a dispatcher is created, so it can outlive the dispatcher that
 enabled the callsite.
 Another layer that enables every callsite keeps the rejected span in the registry as well, and
-with it the nesting, at the cost of creating every span.
-Issue [#11] tracks routing the events of a rejected span to its nearest recorded ancestor.
+with it the routing to its ancestor, at the cost of creating every span.
+
+When the layer is inside an `Option` or a `Vec`, which in tracing-subscriber 0.3.23 do not pass on
+the dispatcher through which the layer looks a rejected span up, an event inside the rejected span
+goes on the track of the innermost recorded span entered on the recording thread, and one that
+names it as its explicit parent on the thread's track.
 
 ## Writers
 
@@ -275,7 +280,6 @@ clock snapshot.
 
 [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 [tokio-rs/tracing#2870]: https://github.com/tokio-rs/tracing/issues/2870
-[#11]: https://github.com/romnn/tracing-perfetto/issues/11
 
 ## Development
 
