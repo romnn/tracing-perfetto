@@ -15,8 +15,7 @@ const OTEL_NAME_FIELD: &str = "otel.name";
 
 /// Collects every visited field as a debug annotation named after the field.
 ///
-/// Booleans, floats and 64-bit integers keep their type, with a `u64` reinterpreted as the
-/// `i64` of the same bits.
+/// Booleans, floats and 64-bit integers keep their type.
 /// Strings, 128-bit integers, errors and [`Debug`](std::fmt::Debug) values become strings.
 #[derive(Default)]
 pub(crate) struct DebugAnnotations {
@@ -70,10 +69,7 @@ impl Visit for DebugAnnotations {
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.push(
-            field,
-            idl::debug_annotation::Value::IntValue(value.cast_signed()),
-        );
+        self.push(field, idl::debug_annotation::Value::UintValue(value));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
