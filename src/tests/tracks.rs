@@ -403,21 +403,18 @@ fn event_in_a_filtered_out_span_skips_an_unrelated_entered_span() -> Result<()> 
     Ok(())
 }
 
-/// Under a per-layer filter on a layer inside an `Option`, an event in a filtered-out span goes
-/// on the track of the innermost recorded span entered on the thread, and one that names the
-/// filtered-out span as its explicit parent on the thread's track.
+/// Checks that under `subscriber`, in which the layer writing to `output` never learns its
+/// dispatcher, an event in a filtered-out span goes on the track of the innermost recorded span
+/// entered on the thread, and one that names the filtered-out span as its explicit parent on the
+/// thread's track.
 ///
-/// The `Option` layer does not pass the dispatcher on to the layer, so the layer cannot look up
-/// the filtered-out span, and routes by the spans that its filtered context shows.
-#[gtest]
-fn event_in_a_filtered_out_span_of_an_optional_layer_goes_to_the_innermost_entered_span()
--> Result<()> {
-    let (layer, output) = annotated_layer();
-    let layer = Some(layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out")));
-    let every_span = tracing_subscriber::fmt::layer().with_writer(std::io::sink);
-    let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::registry().with(layer).with(every_span),
-    );
+/// Without its dispatcher, the layer cannot look up the filtered-out span, so it routes by the
+/// spans that its filtered context shows.
+fn verify_routing_by_the_entered_spans(
+    subscriber: impl Into<tracing::Dispatch>,
+    output: &TestWriter,
+) -> Result<()> {
+    let _guard = tracing::dispatcher::set_default(&subscriber.into());
 
     let root = trace_span!("root");
     let filtered_out = trace_span!(parent: &root, "filtered_out");
@@ -428,7 +425,7 @@ fn event_in_a_filtered_out_span_of_an_optional_layer_goes_to_the_innermost_enter
     drop(filtered_out);
     drop(root);
 
-    let trace = decode(&output)?;
+    let trace = decode(output)?;
     let [thread_track] = thread_track_uuids(&trace)[..] else {
         return fail!("expected one thread track");
     };
@@ -441,6 +438,70 @@ fn event_in_a_filtered_out_span_of_an_optional_layer_goes_to_the_innermost_enter
     expect_eq!(
         instant_marked(&trace, "explicit parent")?.event.track_uuid,
         Some(thread_track)
+    );
+    Ok(())
+}
+
+/// Under a per-layer filter on a layer inside an `Option`, events of a filtered-out span are
+/// routed by the spans entered on the thread.
+///
+/// The `Option` layer does not pass the dispatcher on to the layer.
+#[gtest]
+fn event_in_a_filtered_out_span_of_an_optional_layer_goes_to_the_innermost_entered_span()
+-> Result<()> {
+    let (layer, output) = annotated_layer();
+    let layer = Some(layer.with_filter(filter_fn(|metadata| metadata.name() != "filtered_out")));
+    let every_span = tracing_subscriber::fmt::layer().with_writer(std::io::sink);
+    let subscriber = tracing_subscriber::registry().with(layer).with(every_span);
+    verify_routing_by_the_entered_spans(subscriber, &output)
+}
+
+/// Under a per-layer filter on a layer of a subscriber boxed before it becomes a dispatcher,
+/// events of a filtered-out span are routed by the spans entered on the thread.
+///
+/// The `Box` subscriber does not pass the dispatcher on to the subscriber inside it.
+#[gtest]
+fn event_in_a_filtered_out_span_of_a_boxed_subscriber_goes_to_the_innermost_entered_span()
+-> Result<()> {
+    let (layer, output) = annotated_layer();
+    let subscriber: Box<dyn tracing::Subscriber + Send + Sync> =
+        Box::new(filtering_out_one_span(layer));
+    verify_routing_by_the_entered_spans(subscriber, &output)
+}
+
+/// A layer moved out of one dispatcher's subscriber and attached to another routes the events of
+/// a filtered-out span by the registry of the dispatcher it is now part of.
+///
+/// A layer that kept looking spans up through its first dispatcher, which is still alive, would
+/// find no filtered-out span there and put the event on the thread's track.
+#[gtest]
+fn layer_moved_to_another_dispatcher_looks_spans_up_in_its_new_registry() -> Result<()> {
+    let (layer, output) = annotated_layer();
+
+    // The first dispatcher registers the layer, which a reload handle then moves out of it.
+    let (reloadable, handle) = tracing_subscriber::reload::Layer::new(layer);
+    let first = tracing::Dispatch::new(tracing_subscriber::registry().with(reloadable));
+    let (replacement, _) = annotated_layer();
+    let mut moved = None;
+    handle
+        .modify(|layer| moved = Some(std::mem::replace(layer, replacement)))
+        .or_fail()?;
+    let layer = moved.or_fail()?;
+
+    // The second dispatcher filters out a span whose recorded ancestor the event belongs to.
+    let second = tracing::Dispatch::new(filtering_out_one_span(layer));
+    tracing::dispatcher::with_default(&second, || {
+        let root = trace_span!("root");
+        let filtered_out = trace_span!(parent: &root, "filtered_out");
+        tracing::info!(parent: &filtered_out, marker = "explicit parent");
+    });
+    drop(second);
+    drop(first);
+
+    let trace = decode(&output)?;
+    expect_eq!(
+        instant_marked(&trace, "explicit parent")?.event.track_uuid,
+        Some(span_track_named(&trace, "root")?)
     );
     Ok(())
 }

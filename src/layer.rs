@@ -342,8 +342,9 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
                 .and_then(|span| span_state::nearest_lifetime_track(&span, self.layer_id));
         }
 
-        // A layer that never learned its dispatcher, as inside an `Option` or a `Vec` layer, which
-        // do not pass it on, has only the context's view of the spans.
+        // A layer that never learned its dispatcher, as inside an `Option` or a `Vec` layer or a
+        // `Box` or `Arc` subscriber, or once a reload installed it, has only the context's view of
+        // the spans.
         // An event inside the rejected span then goes to the innermost recorded span entered on
         // the thread, and one that names it as its explicit parent to the thread's track.
         ctx.event_span(event)
@@ -381,11 +382,17 @@ where
     W: PerfettoWriter + 'static,
 {
     fn on_register_dispatch(&self, dispatch: &Dispatch) {
-        // Only the creation of the dispatcher that owns the layer registers it, so the layer is
-        // registered at most once.
-        // Inside an `Option` or a `Vec` layer, which do not pass the call on, it is never
-        // registered.
+        // Only the creation of a dispatcher around the layer registers it, and attaching the layer
+        // anew forgets the dispatcher, so the layer is registered at most once per attachment.
+        // A wrapper that does not pass the call on, such as an `Option` layer or a `Box`
+        // subscriber, and a reload that installs the layer later leave it without a dispatcher.
         self.dispatch.get_or_init(|| dispatch.downgrade());
+    }
+
+    fn on_layer(&mut self, _subscriber: &mut S) {
+        // A layer moved out of one subscriber, such as through a reload handle, and attached to
+        // another is part of the new subscriber's dispatcher only, whose creation registers it.
+        self.dispatch = OnceLock::new();
     }
 
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {

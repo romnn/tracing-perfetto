@@ -170,10 +170,13 @@ enabled the callsite.
 Another layer that enables every callsite keeps the rejected span in the registry as well, and
 with it the routing to its ancestor, at the cost of creating every span.
 
-When the layer is inside an `Option` or a `Vec`, which in tracing-subscriber 0.3.23 do not pass on
-the dispatcher through which the layer looks a rejected span up, an event inside the rejected span
-goes on the track of the innermost recorded span entered on the recording thread, and one that
-names it as its explicit parent on the thread's track.
+The layer looks a rejected span up through the dispatcher it is part of, which it learns when that
+dispatcher is created around it.
+As of tracing-subscriber 0.3.23 and tracing-core 0.1.36, it never learns it inside an `Option` or a
+`Vec` layer, in a subscriber boxed or wrapped in an `Arc` before it becomes a `Dispatch`, or when
+`reload::Handle::reload` installs it in place of another layer.
+An event inside a rejected span then goes on the track of the innermost recorded span entered on
+the recording thread, and one that names it as its explicit parent on the thread's track.
 
 ## Writers
 
