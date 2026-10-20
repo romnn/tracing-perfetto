@@ -151,17 +151,22 @@ A span that the filter rejects has no slices, and the layer does not see it:
   it, but it can be an unrelated span that happens to be entered.
 - An event that names the rejected span as its explicit parent goes on the thread's track.
 
-If no layer of the registry enables the rejected span's callsite, as with the single filtered
-layer above, and no other dispatcher in the process enables it either, the span is `Span::none`.
+The rejected span is `Span::none` only when its callsite's interest is `never`, which tracing
+caches once per callsite for every dispatcher of the process.
+That is the case for a filter that decides by metadata alone, such as `filter_fn` above or a level
+filter, when no layer of the registry and no other dispatcher in the process enables the callsite.
 A span created inside a task that it instruments on another thread, and a span that names it as
 its explicit parent, then become roots.
-Another layer that enables every callsite keeps the rejected span in the registry and with it the
-nesting, at the cost of creating every span.
-So does another dispatcher in the process that enables the callsite, such as the subscriber of
-another test in the same test binary, because tracing caches one interest per callsite for every
-dispatcher of the process.
-That cache is rebuilt when a dispatcher is created, so it can outlive the dispatcher that enabled
-the callsite.
+
+With tracing-subscriber 0.3.23, a span rejected only at runtime, under `sometimes` interest, still
+exists in the registry, so its children nest on its nearest recorded ancestor.
+That happens with a filter that reads the context, such as `dynamic_filter_fn`, and when another
+dispatcher in the process enables the callsite, such as the subscriber of another test in the same
+test binary.
+The cached interest is rebuilt when a dispatcher is created, so it can outlive the dispatcher that
+enabled the callsite.
+Another layer that enables every callsite keeps the rejected span in the registry as well, and
+with it the nesting, at the cost of creating every span.
 Issue [#11] tracks routing the events of a rejected span to its nearest recorded ancestor.
 
 ## Writers
