@@ -4,7 +4,7 @@
 use crate::idl;
 use crate::tests::{
     annotated_layer, close_labeled, decode, event_name, instant_marked, replay_slices,
-    track_descriptor, track_event,
+    track_descriptor, track_event, wait_until,
 };
 use crate::{FinishHandle, PerfettoLayer};
 use googletest::prelude::*;
@@ -16,6 +16,10 @@ use std::time::Duration;
 use tracing::{field, info, info_span};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
+
+/// The bound on waiting for another thread to let go of a dispatch, far above any scheduling
+/// delay on a loaded machine.
+const RELEASE_BOUND: Duration = Duration::from_secs(30);
 
 /// The message of the error that a [`FailingWriter`] returns.
 const INJECTED_ERROR: &str = "injected write failure";
@@ -605,7 +609,12 @@ impl std::io::Write for PanickingWrite {
 fn a_panic_that_poisons_a_mutex_writer_is_reported_without_calling_it_again() -> Result<()> {
     let layer = PerfettoLayer::new(std::sync::Mutex::new(PanickingWrite));
     let finish = layer.finish_handle();
-    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+    // tracing briefly holds every dispatcher from a thread that creates a dispatcher or registers
+    // a callsite, which may then drop the layer there instead of in the test.
+    // The dispatch therefore holds the subscriber through an `Arc`, whose last handle the test
+    // drops once no other thread holds the dispatch.
+    let subscriber = Arc::new(tracing_subscriber::registry().with(layer));
+    let dispatch = tracing::Dispatch::new(Arc::clone(&subscriber));
 
     let panicked = tracing::dispatcher::with_default(&dispatch, || {
         std::panic::catch_unwind(|| info!("panics"))
@@ -617,8 +626,12 @@ fn a_panic_that_poisons_a_mutex_writer_is_reported_without_calling_it_again() ->
     verify_that!(recorded_after, ok(anything()))?;
 
     expect_finish_reports_the_panic(&finish)?;
+    drop(dispatch);
+    if !wait_until(RELEASE_BOUND, || Arc::strong_count(&subscriber) == 1) {
+        return fail!("another thread kept the dispatch");
+    }
     verify_that!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(dispatch))),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(subscriber))),
         ok(anything())
     )
 }

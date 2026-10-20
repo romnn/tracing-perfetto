@@ -153,6 +153,9 @@
 //! [`FinishHandle::finish`] is the end of the trace: it waits for the writes under way, flushes
 //! the writer, and nothing is written afterwards.
 //! Dropping the layer ends the trace the same way.
+//! tracing can briefly hold the subscriber from another thread, which then drops the layer and
+//! ends the trace there, slightly after the application dropped its last handle, so finish the
+//! trace through a [`FinishHandle`] when the application must know that it is complete.
 //! [`FinishHandle::finish`] returns the writer's first error, after which the layer wrote nothing
 //! more, so the output stays readable up to the failed write.
 //! A writer that panics fails the trace the same way, and the panic propagates to the caller,

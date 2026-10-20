@@ -187,6 +187,9 @@ A `Mutex<File>` is the usual writer, and a `Mutex<BufWriter<File>>` writes fewer
 writer, and the layer writes nothing afterwards.
 Dropping the layer ends the trace the same way, but a global dispatcher never drops its layer, so
 call `finish()` before the process exits.
+tracing can briefly hold the subscriber from another thread, which then drops the layer and ends
+the trace there, slightly after the application dropped its last handle, so call `finish()` when
+the application must know that the trace is complete.
 After the first failed write the layer writes nothing more, so the file stays readable up to that
 write, and `finish()` returns the error, or else an error of the flush.
 A writer that panics fails the trace the same way: the panic reaches the code that recorded the
