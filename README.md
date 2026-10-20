@@ -218,7 +218,8 @@ recorder=$(sudo tracebox --background-wait --txt -c system.cfg -o system.pftrace
 ./my-app
 # SIGTERM stops the recording, which then writes the rest of system.pftrace and exits.
 sudo kill -TERM "$recorder"
-while [ -d "/proc/$recorder" ]; do sleep 0.1; done
+# The recorder counts as exited in state Z too, since a container's PID 1 may never reap it.
+while grep -qs '^State:[[:space:]]*[^Z[:space:]]' "/proc/$recorder/status"; do sleep 0.1; done
 # The recorder creates its output readable only by its own user.
 sudo chown "$USER" system.pftrace
 cat app.pftrace system.pftrace > merged.pftrace
