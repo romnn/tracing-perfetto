@@ -1,13 +1,33 @@
 //! The trusted packet sequence a layer writes on, with its clock and preamble.
 
 use crate::{idl, packets};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 /// The clock that every timestamped packet of a layer refers to.
 ///
 /// IDs 64 to 127 are user-defined clocks scoped to one trusted packet sequence, so each layer
 /// defines its own clock without colliding with another layer's.
+///
+/// On Linux and Android it counts boot time, which keeps counting while the system is
+/// suspended, from the layer's epoch, so the one snapshot of the preamble maps it onto boot time
+/// for the whole trace.
+/// Elsewhere it counts [`Instant`](std::time::Instant) time from the epoch.
 pub(crate) const SEQUENCE_CLOCK_ID: u32 = 64;
+
+/// The clock that trace processor converts every timestamp to.
+///
+/// A system trace that `traced` records on Linux or Android is timestamped in boot time.
+/// Trace processor follows the trace clock that a snapshot declares only until it converts its
+/// first timestamp, so in a concatenated file the leading trace's declaration stays.
+/// Declaring boot time here, as `traced` does, aligns the layer's slices with such a trace
+/// exactly in either order, and never through the wall clock, which NTP steps and slews.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TRACE_CLOCK: idl::BuiltinClock = idl::BuiltinClock::Boottime;
+/// The clock that trace processor converts every timestamp to.
+///
+/// No boot time reading is available here, so the wall clock is the trace clock.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const TRACE_CLOCK: idl::BuiltinClock = idl::BuiltinClock::Realtime;
 
 /// The packet sequence shared by a layer and its process-memory sampler.
 ///
@@ -17,8 +37,12 @@ pub(crate) const SEQUENCE_CLOCK_ID: u32 = 64;
 pub(crate) struct TraceSequence {
     sequence_id: u32,
     process_track_uuid: u64,
+    /// The zero point of [`SEQUENCE_CLOCK_ID`], in boot time nanoseconds.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    epoch: u64,
     /// The zero point of [`SEQUENCE_CLOCK_ID`].
-    epoch: Instant,
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    epoch: std::time::Instant,
 }
 
 impl TraceSequence {
@@ -30,7 +54,10 @@ impl TraceSequence {
         Self {
             sequence_id: rand::random_range(2..=u32::MAX),
             process_track_uuid: packets::unique_uuid(),
-            epoch: Instant::now(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            epoch: boot_time_nanos(),
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            epoch: std::time::Instant::now(),
         }
     }
 
@@ -40,8 +67,21 @@ impl TraceSequence {
     }
 
     /// Returns the current time on [`SEQUENCE_CLOCK_ID`], in nanoseconds since the epoch.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn now(&self) -> u64 {
+        self.since_epoch(boot_time_nanos())
+    }
+
+    /// Returns the current time on [`SEQUENCE_CLOCK_ID`], in nanoseconds since the epoch.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub(crate) fn now(&self) -> u64 {
         duration_nanos(self.epoch.elapsed())
+    }
+
+    /// Returns the time on [`SEQUENCE_CLOCK_ID`] at the boot time `boot_time`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn since_epoch(&self, boot_time: u64) -> u64 {
+        boot_time.saturating_sub(self.epoch)
     }
 
     /// Returns a packet on this sequence, timestamped now on [`SEQUENCE_CLOCK_ID`].
@@ -76,30 +116,39 @@ impl TraceSequence {
     /// Builds the process track descriptor and the clock snapshot that defines
     /// [`SEQUENCE_CLOCK_ID`].
     ///
-    /// The snapshot pairs the sequence clock with the wall clock and makes the wall clock the trace
-    /// clock, so trace processor keeps the monotonic ordering and displays wall-clock time.
+    /// The snapshot pairs the sequence clock with the wall clock and, on Linux and Android, with
+    /// boot time.
+    /// It makes [`TRACE_CLOCK`] the trace clock, so trace processor keeps the monotonic ordering.
+    /// The Perfetto UI shows wall-clock time through the snapshot's wall-clock reading whichever
+    /// clock is the trace clock.
+    ///
+    /// The snapshot reads no monotonic time.
+    /// Trace processor would convert another producer's monotonic timestamps through this
+    /// snapshot's offset between monotonic time and boot time, which goes stale at the next
+    /// suspend, instead of through the system trace's own snapshots.
     pub(crate) fn preamble_trace(&self) -> idl::Trace {
-        // Read both clocks back to back so that the snapshot pins their offset.
-        let sequence_timestamp = self.now();
-        let realtime_timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, duration_nanos);
+        // Read all clocks back to back so that the snapshot pins their offsets.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let clocks = {
+            // One boot time reading yields both the sequence clock and boot time, so their
+            // pairing is exact.
+            let boot_time = boot_time_nanos();
+            let realtime_clock = realtime_clock();
+            vec![
+                snapshot_clock(Some(SEQUENCE_CLOCK_ID), self.since_epoch(boot_time)),
+                snapshot_clock(builtin_clock_id(idl::BuiltinClock::Boottime), boot_time),
+                realtime_clock,
+            ]
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let clocks = {
+            let sequence_clock = snapshot_clock(Some(SEQUENCE_CLOCK_ID), self.now());
+            vec![sequence_clock, realtime_clock()]
+        };
 
-        let realtime_clock = idl::BuiltinClock::Realtime;
         let clock_snapshot = idl::ClockSnapshot {
-            clocks: vec![
-                idl::clock_snapshot::Clock {
-                    clock_id: Some(SEQUENCE_CLOCK_ID),
-                    timestamp: Some(sequence_timestamp),
-                    ..Default::default()
-                },
-                idl::clock_snapshot::Clock {
-                    clock_id: u32::try_from(i32::from(realtime_clock)).ok(),
-                    timestamp: Some(realtime_timestamp),
-                    ..Default::default()
-                },
-            ],
-            primary_trace_clock: Some(realtime_clock.into()),
+            clocks,
+            primary_trace_clock: Some(TRACE_CLOCK.into()),
         };
 
         idl::Trace {
@@ -117,4 +166,36 @@ impl TraceSequence {
 /// Returns `duration` in nanoseconds, saturating at [`u64::MAX`] after about 584 years.
 fn duration_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Returns a snapshot entry that reads `timestamp` on `clock_id`.
+fn snapshot_clock(clock_id: Option<u32>, timestamp: u64) -> idl::clock_snapshot::Clock {
+    idl::clock_snapshot::Clock {
+        clock_id,
+        timestamp: Some(timestamp),
+        ..Default::default()
+    }
+}
+
+/// Returns the snapshot ID of a builtin clock.
+fn builtin_clock_id(clock: idl::BuiltinClock) -> Option<u32> {
+    u32::try_from(i32::from(clock)).ok()
+}
+
+/// Returns the current boot time in nanoseconds, which counts the time the system is suspended.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn boot_time_nanos() -> u64 {
+    let boot_time = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    Duration::try_from(boot_time).map_or(0, duration_nanos)
+}
+
+/// Returns a snapshot entry that reads the wall clock now.
+fn realtime_clock() -> idl::clock_snapshot::Clock {
+    let realtime_timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, duration_nanos);
+    snapshot_clock(
+        builtin_clock_id(idl::BuiltinClock::Realtime),
+        realtime_timestamp,
+    )
 }

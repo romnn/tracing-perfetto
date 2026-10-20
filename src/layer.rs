@@ -37,7 +37,9 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 /// Every packet is written when the layer observes it, so a trace cut short still holds every
 /// slice begun so far.
 ///
-/// Timestamps come from a monotonic clock that the trace maps onto wall-clock time.
+/// Timestamps come from a monotonic clock, which on Linux and Android counts boot time.
+/// The trace maps it onto boot time there, so it merges with a system trace, and onto wall-clock
+/// time elsewhere.
 /// Several layers can share one registry, and each writes a trace that opens on its own.
 ///
 /// Dropping the layer, or finishing it through a [`FinishHandle`], ends the trace and flushes the

@@ -196,11 +196,71 @@ panic unwinds is caught, since a second panic there aborts the process.
   of a `Mutex<BufWriter<File>>`, or anything else the writer or the process-memory source needs,
   because both wait for the write in progress and then flush the writer themselves.
 
+## System traces
+
+On Linux and Android, a system trace that Perfetto's `traced` records, with kernel scheduling,
+CPU frequency and other processes, merges with the layer's trace.
+The layer timestamps with boot time, which the system trace is timestamped in and which keeps
+counting while the system is suspended, and makes it the trace clock.
+Trace processor then places the app's slices among the scheduler data exactly, whichever trace
+comes first, and never through the wall clock, which NTP steps and slews.
+
+Record the system trace while the app writes its own, then concatenate the two and open the
+result in the Perfetto UI:
+
+```bash
+# Cache the sudo credentials, so that no password prompt holds up the recording.
+sudo -v
+# Kernel tracing needs access to tracefs, usually as root.
+# --background-wait returns once every data source has started, and prints the recorder's PID.
+recorder=$(sudo tracebox --background-wait --txt -c system.cfg -o system.pftrace)
+# The app writes app.pftrace while the system trace records.
+./my-app
+# SIGTERM stops the recording, which then writes the rest of system.pftrace and exits.
+sudo kill -TERM "$recorder"
+# The recorder counts as exited in state Z too, since a container's PID 1 may never reap it.
+while grep -qs '^State:[[:space:]]*[^Z[:space:]]' "/proc/$recorder/status"; do sleep 0.1; done
+# The recorder creates its output readable only by its own user.
+sudo chown "$USER" system.pftrace
+cat app.pftrace system.pftrace > merged.pftrace
+```
+
+With `traced` and `traced_probes` already running, as on Android, `perfetto` takes the place of
+`tracebox` with the same arguments.
+A minimal `system.cfg` that records scheduling and CPU frequency until the recorder stops:
+
+```text
+buffers { size_kb: 65536 }
+data_sources {
+  config {
+    name: "linux.ftrace"
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "power/cpu_frequency"
+    }
+  }
+}
+data_sources { config { name: "linux.process_stats" } }
+```
+
+Timestamps in trace processor are boot-time nanoseconds on Linux and Android, and wall-clock
+nanoseconds elsewhere.
+Boot time starts anew at every boot of every machine, so concatenated traces line up only if
+they were recorded on the same machine during the same boot.
+Traces from two machines, or from before and after a reboot, land apart by the difference of
+their boot times.
+The Perfetto UI shows wall-clock time either way, through the wall-clock reading of the layer's
+clock snapshot.
+
 ## Known limitations
 
 - With tracing-subscriber 0.3.23, a child span that closes on a thread whose default dispatcher
   is another one leaves its parent's lifetime slice without an end, or panics (see
   [Installing](#installing), [#9]).
+- On macOS, the layer timestamps with `CLOCK_UPTIME_RAW`, which stops while the system sleeps,
+  and maps it onto the wall clock through one reading at its first write.
+  After a sleep during the trace, the wall-clock times of later slices run behind by the time
+  the system slept.
 
 [#9]: https://github.com/romnn/tracing-perfetto/issues/9
 [tokio-rs/tracing#2870]: https://github.com/tokio-rs/tracing/issues/2870
