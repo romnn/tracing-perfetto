@@ -14,6 +14,8 @@ It provides:
 - Named tracks through a `perfetto.track_name` span field.
 - Slice names from `perfetto.slice_name` or OpenTelemetry's `otel.name`.
 - Span and event fields as debug annotations.
+- Counter tracks from numeric `counter.<name>` event fields, with an optional unit, as in
+  `counter.buffered.bytes`.
 - A `process.rss` counter track that samples the process's resident set size, with a pluggable
   `ProcessMemorySource`.
 - A `FinishHandle` that ends the trace while the layer is still installed in a global dispatcher.
@@ -104,6 +106,26 @@ In the Perfetto UI, spans and events appear on these tracks below the process:
 `with_thread_slices(false)` turns entered slices off.
 `with_span_lifetimes(false)` turns lifetime slices off, which leaves a synchronous program a plain
 flame chart per thread.
+
+## Counters
+
+An event field named `counter.<name>` with a numeric value is a value on a counter track named
+`<name>`, at the time of the event:
+
+```rust
+tracing::info!(counter.queue_depth = 3, counter.buffered.bytes = 4096_u64, "enqueued");
+```
+
+- When the rest of the field's name has more than one `.`-segment, the last one is the counter's
+  unit: `bytes`, `ns` and `count` are the counter units that Perfetto knows, and any other unit is
+  shown as written.
+- Each counter track sits below the process track, so the values of one counter from every thread
+  are one series, and the unit of the counter's first value is the unit of its track.
+- An integer that fits an `i64` is written as an integer, and any other number as the nearest
+  double, so a `u64` above `i64::MAX` keeps its magnitude but may lose its last digits.
+- The event is still an instant, with its other fields as debug annotations.
+  A `counter.*` field of another type, such as a string or a boolean, is a debug annotation like
+  any other field.
 
 ## Filtering
 

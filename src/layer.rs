@@ -1,7 +1,8 @@
 //! The [`PerfettoLayer`], its builder methods, and the tracing callbacks that write a span or
 //! event as trace packets when the layer observes it.
 
-use crate::fields::{DebugAnnotations, NamingFields};
+use crate::event_counters::EventCounterTracks;
+use crate::fields::{DebugAnnotations, EventFields, NamingFields};
 use crate::lifecycle::{FinishHandle, TraceLifecycle};
 use crate::packets::{self, SourceLocation, UnplacedEvent};
 use crate::process_memory::sampler::{
@@ -26,6 +27,9 @@ use tracing_subscriber::registry::{LookupSpan, SpanRef};
 
 /// A [`Layer`] that streams spans as slices and events as instants into a Perfetto trace.
 ///
+/// The numeric `counter.*` fields of events are values on counter tracks, as the
+/// [crate documentation](crate#counters) describes.
+///
 /// A span's lifetime slice begins when the span is created and ends when it closes, whichever
 /// thread closes it, on a track chosen as the [crate documentation](crate#tracks) describes.
 /// Each time a thread enters the span, an entered slice runs on that thread's track until the
@@ -46,6 +50,8 @@ pub struct PerfettoLayer<W> {
     threads: ThreadStates,
     /// The counter track of the process-memory samples, which every sampler of the layer reuses.
     process_memory_rss_track: Arc<CounterTrack>,
+    /// The counter tracks that the `counter.*` fields of events write to.
+    event_counters: EventCounterTracks,
     lifecycle: Arc<TraceLifecycle>,
 }
 
@@ -87,6 +93,7 @@ impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
             config: Config::default(),
             threads: ThreadStates::new(layer_id),
             process_memory_rss_track: Arc::new(CounterTrack::new()),
+            event_counters: EventCounterTracks::default(),
             lifecycle,
         }
     }
@@ -101,7 +108,8 @@ impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
     ///
     /// Disabled by default, because formatting every field costs time on every span and event,
     /// and the fields recorded on a span stay in memory until it closes.
-    /// When enabled, an event's fields are annotations on its instant.
+    /// When enabled, an event's fields are annotations on its instant, except for the numeric
+    /// `counter.*` fields, which are values on counter tracks either way.
     /// A span's creation fields are annotations on its lifetime slice's begin, and fields
     /// recorded later are annotations on its end.
     /// Without span lifetimes, each entered slice's begin carries the fields given and recorded
@@ -202,13 +210,14 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         })
     }
 
-    /// Writes `events` on the calling thread's track, which is described on its first use.
+    /// Writes `events` at `timestamp` on the calling thread's track, which is described on its
+    /// first use.
     ///
     /// The descriptor goes in the same `Trace` message as the events, so no packet refers to the
     /// thread's track before the trace describes it.
     /// The events share one timestamp, so slices that a non-LIFO exit ends and begins again
     /// resume exactly where they ended.
-    fn write_on_thread_track(&self, events: Vec<UnplacedEvent>) {
+    fn write_on_thread_track(&self, events: Vec<UnplacedEvent>, timestamp: u64) {
         let track_uuid = thread_track::current_thread_uuid();
         let mut trace_packets = Vec::with_capacity(events.len() + 1);
 
@@ -225,7 +234,6 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
                 ),
             ));
         }
-        let timestamp = self.sink.sequence().now();
         trace_packets.extend(
             events
                 .into_iter()
@@ -238,7 +246,7 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         }
     }
 
-    /// Writes `event` on the span track `track_uuid`, timestamped now.
+    /// Writes `event` at `timestamp` on the span track `track_uuid`.
     ///
     /// The descriptor of a track that `event` is the first to use, if any, goes in the same
     /// `Trace` message.
@@ -247,11 +255,11 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         track_uuid: u64,
         new_track: Option<idl::TrackDescriptor>,
         event: UnplacedEvent,
+        timestamp: u64,
     ) {
         let mut trace_packets = Vec::with_capacity(2);
         trace_packets.extend(new_track.map(packets::track_descriptor_packet));
-        trace_packets
-            .push(self.event_packet(event.on_track(track_uuid), self.sink.sequence().now()));
+        trace_packets.push(self.event_packet(event.on_track(track_uuid), timestamp));
         self.write_packets(trace_packets);
     }
 
@@ -285,7 +293,12 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
             self.sink.sequence().process_track_uuid(),
             own_track_name,
         );
-        self.write_on_span_track(lifetime.track_uuid, new_track, begin);
+        self.write_on_span_track(
+            lifetime.track_uuid,
+            new_track,
+            begin,
+            self.sink.sequence().now(),
+        );
         lifetime
     }
 }
@@ -300,6 +313,11 @@ impl<W> PerfettoLayer<W> {
     /// Returns the sink that the layer and its sampler share.
     pub(crate) fn sink(&self) -> &Arc<TraceSink<W>> {
         &self.sink
+    }
+
+    /// Returns the counter tracks that the `counter.*` fields of events write to.
+    pub(crate) fn event_counters(&self) -> &EventCounterTracks {
+        &self.event_counters
     }
 }
 
@@ -417,15 +435,24 @@ where
             return;
         }
         let metadata = event.metadata();
-        let mut debug_annotations = DebugAnnotations::default();
-        if self.config.debug_annotations {
-            event.record(&mut debug_annotations);
-        }
+        let mut fields = EventFields::new(self.config.debug_annotations);
+        event.record(&mut fields);
+        let EventFields {
+            counters,
+            annotations,
+        } = fields;
+
+        // The counter values and the instant share the event's timestamp.
+        let timestamp = self.sink.sequence().now();
+        self.event_counters.write(&self.sink, counters, timestamp);
+
         let instant = UnplacedEvent {
             event_type: idl::track_event::Type::Instant,
             name: Some(Cow::Borrowed(metadata.name())),
             location: SourceLocation::of(metadata),
-            debug_annotations: debug_annotations.annotations,
+            debug_annotations: annotations
+                .map(|annotations| annotations.annotations)
+                .unwrap_or_default(),
             correlation_id: None,
         };
 
@@ -441,8 +468,8 @@ where
             })
         });
         match span_track_uuid {
-            Some(track_uuid) => self.write_on_span_track(track_uuid, None, instant),
-            None => self.write_on_thread_track(vec![instant]),
+            Some(track_uuid) => self.write_on_span_track(track_uuid, None, instant, timestamp),
+            None => self.write_on_thread_track(vec![instant], timestamp),
         }
     }
 
@@ -472,7 +499,7 @@ where
             .with_current(|thread| thread.entered.enter(id.clone(), begin.clone()))
             .is_some();
         if entered {
-            self.write_on_thread_track(vec![begin]);
+            self.write_on_thread_track(vec![begin], self.sink.sequence().now());
         }
     }
 
@@ -487,7 +514,7 @@ where
             .with_current(|thread| thread.entered.exit(id))
             .unwrap_or_default();
         if !events.is_empty() {
-            self.write_on_thread_track(events);
+            self.write_on_thread_track(events, self.sink.sequence().now());
         }
     }
 
@@ -511,6 +538,7 @@ where
             lifetime.track_uuid,
             None,
             UnplacedEvent::slice_end(span_state.recorded_annotations),
+            self.sink.sequence().now(),
         );
 
         // Free the parent's track only after writing the end, so a sibling that nests there next
