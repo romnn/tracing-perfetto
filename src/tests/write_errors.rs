@@ -450,6 +450,29 @@ fn a_failed_counter_descriptor_write_leaves_no_sample_on_the_counter_track() -> 
     Ok(())
 }
 
+/// An event counter whose descriptor fails to write leaves no value on an undescribed track, and
+/// finishing reports the failure.
+///
+/// The descriptor goes in the message of the counter's first value, so the failed message takes
+/// that value with it, and the gate keeps every later value out of the trace.
+#[gtest]
+fn a_failed_event_counter_descriptor_write_leaves_no_value_on_an_undescribed_track() -> Result<()> {
+    let writer = FailingWriter::new(0, describes_a_counter);
+    let output = writer.output();
+    let layer = failing_layer(writer);
+    let finish = layer.finish_handle();
+
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+        for depth in 0..2 {
+            info!(counter.depth = depth, "outside");
+        }
+    });
+
+    expect_finish_reports_the_failure(&finish)?;
+    expect_readable_up_to_failure(&output)?;
+    Ok(())
+}
+
 /// A writer that panics partway through a message leaves the messages written before it,
 /// followed only by the fragment of the panicking one, and finishing reports the panic.
 ///

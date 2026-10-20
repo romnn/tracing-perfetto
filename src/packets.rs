@@ -60,6 +60,20 @@ pub(crate) fn track_descriptor_packet(descriptor: idl::TrackDescriptor) -> idl::
     }
 }
 
+/// Returns a counter event that sets the counter track `track_uuid` to `value`.
+pub(crate) fn counter_event(
+    track_uuid: u64,
+    value: idl::track_event::CounterValueField,
+) -> idl::TrackEvent {
+    let mut event = idl::TrackEvent {
+        track_uuid: Some(track_uuid),
+        counter_value_field: Some(value),
+        ..Default::default()
+    };
+    event.set_type(idl::track_event::Type::Counter);
+    event
+}
+
 /// Returns the packet that describes the process track `process_track_uuid` of this process.
 pub(crate) fn process_descriptor_packet(process_track_uuid: u64) -> idl::TracePacket {
     let process = idl::ProcessDescriptor {

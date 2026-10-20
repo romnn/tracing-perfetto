@@ -3,6 +3,7 @@
 //! [`PerfettoLayer`] records each span as a lifetime slice from its creation to its close, each
 //! entry of a span as an entered slice on the entering thread's track, and each event as an
 //! instant.
+//! The numeric `counter.*` fields of events are values on [counter tracks](#counters).
 //! It streams them as encoded `Trace` protobuf packets to a [`PerfettoWriter`] as they happen, so
 //! a slice's begin is in the trace while the span is still open.
 //! Open the output in the [Perfetto UI].
@@ -97,6 +98,28 @@
 //! [per-layer filter]: tracing_subscriber::Layer::with_filter
 //! [#11]: https://github.com/romnn/tracing-perfetto/issues/11
 //!
+//! # Counters
+//!
+//! An event field named `counter.<name>` with a numeric value is a value on a counter track named
+//! `<name>`, at the time of the event.
+//! When the rest of the field's name has more than one `.`-segment, the last one is the
+//! counter's unit, as in `counter.buffered.bytes`.
+//! The units `bytes`, `ns` and `count` are the counter units that Perfetto knows, and any other
+//! unit is shown as written.
+//! Each counter track sits below the process track, so the values of one counter from every
+//! thread are one series, and the unit of the counter's first value is the unit of its track.
+//!
+//! An integer that fits an `i64` is written as an integer, and any other number as the nearest
+//! double, so a `u64` above `i64::MAX` keeps its magnitude but may lose its last digits.
+//! The event is still an instant, which carries its other fields as debug annotations when
+//! [`PerfettoLayer::with_debug_annotations`] enables them.
+//! A `counter.*` field of another type, such as a string or a boolean, is then a debug annotation
+//! like any other field.
+//!
+//! ```
+//! tracing::info!(counter.queue_depth = 3, counter.buffered.bytes = 4096_u64, "enqueued");
+//! ```
+//!
 //! # Process memory and finishing
 //!
 //! [`PerfettoLayer::with_process_memory_rss`] adds a counter track that samples the process's
@@ -188,6 +211,7 @@ mod idl {
 }
 
 mod decode;
+mod event_counters;
 mod fields;
 mod layer;
 mod lifecycle;

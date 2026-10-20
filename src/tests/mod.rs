@@ -13,6 +13,7 @@ mod annotations;
 mod concurrent_finish;
 mod cross_dispatcher;
 mod entered_stack;
+mod event_counters;
 mod finish;
 mod layer;
 mod sampler_lifecycle;
@@ -192,6 +193,23 @@ fn string_annotation<'a>(annotations: &'a [idl::DebugAnnotation], name: &str) ->
             _ => None,
         },
     )
+}
+
+/// Returns the value of the annotation named `name`, or `None` if `annotations` has none.
+fn annotation_value<'a>(
+    annotations: &'a [idl::DebugAnnotation],
+    name: &str,
+) -> Option<&'a idl::debug_annotation::Value> {
+    annotations
+        .iter()
+        .find_map(|annotation| match &annotation.name_field {
+            Some(idl::debug_annotation::NameField::Name(annotation_name))
+                if annotation_name == name =>
+            {
+                annotation.value.as_ref()
+            }
+            _ => None,
+        })
 }
 
 fn annotation_names(annotations: &[idl::DebugAnnotation]) -> Vec<&str> {

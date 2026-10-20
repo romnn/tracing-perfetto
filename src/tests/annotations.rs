@@ -1,26 +1,9 @@
 //! Regression tests for the debug annotations that event fields are written as.
 
 use crate::idl;
-use crate::tests::{annotated_layer, decode, instant_marked};
+use crate::tests::{annotated_layer, annotation_value, decode, instant_marked};
 use googletest::prelude::*;
 use tracing_subscriber::layer::SubscriberExt;
-
-/// Returns the value of the annotation named `name`, or `None` if `annotations` has none.
-fn annotation_value<'a>(
-    annotations: &'a [idl::DebugAnnotation],
-    name: &str,
-) -> Option<&'a idl::debug_annotation::Value> {
-    annotations
-        .iter()
-        .find_map(|annotation| match &annotation.name_field {
-            Some(idl::debug_annotation::NameField::Name(annotation_name))
-                if annotation_name == name =>
-            {
-                annotation.value.as_ref()
-            }
-            _ => None,
-        })
-}
 
 /// A `u64` field keeps its value as an unsigned annotation, including above `i64::MAX`.
 ///

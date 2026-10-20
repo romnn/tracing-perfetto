@@ -234,15 +234,10 @@ fn write_sample<W: PerfettoWriter>(config: &ProcessMemorySamplerConfig<W>, rss_b
     let mut packet = sequence.timestamped_packet();
 
     let counter_value = i64::try_from(rss_bytes).unwrap_or(i64::MAX);
-    let mut event = idl::TrackEvent {
-        track_uuid: Some(track.uuid),
-        counter_value_field: Some(idl::track_event::CounterValueField::CounterValue(
-            counter_value,
-        )),
-        ..Default::default()
-    };
-    event.set_type(idl::track_event::Type::Counter);
-    packet.data = Some(idl::trace_packet::Data::TrackEvent(event));
+    packet.data = Some(idl::trace_packet::Data::TrackEvent(packets::counter_event(
+        track.uuid,
+        idl::track_event::CounterValueField::CounterValue(counter_value),
+    )));
 
     let mut trace_packets = Vec::with_capacity(2);
     if include_descriptor {
