@@ -123,9 +123,10 @@ tracing::info!(counter.queue_depth = 3, counter.buffered.bytes = 4096_u64, "enqu
   are one series, and the unit of the counter's first value is the unit of its track.
 - An integer that fits an `i64` is written as an integer, and any other number as the nearest
   double, so a `u64` above `i64::MAX` keeps its magnitude but may lose its last digits.
-- The event is still an instant, with its other fields as debug annotations.
-  A `counter.*` field of another type, such as a string or a boolean, is a debug annotation like
-  any other field.
+- The event is still an instant, which carries its other fields as debug annotations when
+  `with_debug_annotations(true)` enables them.
+  A `counter.*` field of another type, such as a string or a boolean, is then a debug annotation
+  like any other field.
 
 ## Filtering
 

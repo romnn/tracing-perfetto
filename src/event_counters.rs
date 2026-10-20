@@ -36,8 +36,10 @@ impl EventCounterTracks {
     ///
     /// A track is described with the unit of the first sample of its name, and counts as
     /// described only once that message is written, so no value lands on an undescribed track.
-    /// A write of the first value of a counter waits for a write on another thread that
-    /// describes it, so each track is described once.
+    /// Every write holds the lock of the tracks until its message is written, so counter writes
+    /// go one at a time.
+    /// A first value on another thread therefore waits for the write that describes its track,
+    /// and each track is described once.
     pub(crate) fn write<W: PerfettoWriter>(
         &self,
         sink: &TraceSink<W>,
