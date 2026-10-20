@@ -65,12 +65,25 @@
 //!   it, but it can be an unrelated span that happens to be entered.
 //! - An event that names the rejected span as its explicit parent goes on the thread's track.
 //!
-//! If no layer of the registry enables the rejected span's callsite, as with a single filtered
-//! layer, the span is [`Span::none`](tracing::Span::none).
+//! When its callsite's interest is `never`, the rejected span is
+//! [`Span::none`](tracing::Span::none), and tracing caches that interest once per callsite for
+//! every dispatcher of the process.
+//! That is the case for a filter that decides by metadata alone, such as [`filter_fn`] or a level
+//! filter, when no layer of the registry and no other dispatcher in the process enables the
+//! callsite.
 //! A span created inside a task that it instruments on another thread, and a span that names it
 //! as its explicit parent, then become roots.
-//! Another layer that enables every callsite keeps the rejected span in the registry and with it
-//! the nesting, at the cost of creating every span.
+//!
+//! With tracing-subscriber 0.3.23, a span that only per-layer filters reject at runtime, under
+//! `sometimes` interest, still exists in the registry, so its children nest on its nearest
+//! recorded ancestor.
+//! That happens with a filter that reads the context, such as [`dynamic_filter_fn`], and when
+//! another dispatcher in the process enables the callsite, such as the subscriber of another test
+//! in the same test binary.
+//! The cached interest is rebuilt when a dispatcher is created, so it can outlive the dispatcher
+//! that enabled the callsite.
+//! Another layer that enables every callsite keeps the rejected span in the registry as well, and
+//! with it the nesting, at the cost of creating every span.
 //! Issue [#11] tracks routing the events of a rejected span to its nearest recorded ancestor.
 //!
 //! A filter can select by target or level, or by a field that marks the spans and events to
@@ -96,6 +109,8 @@
 //! without a value, as in `#[instrument(fields(perfetto))]`.
 //!
 //! [per-layer filter]: tracing_subscriber::Layer::with_filter
+//! [`filter_fn`]: tracing_subscriber::filter::filter_fn
+//! [`dynamic_filter_fn`]: tracing_subscriber::filter::dynamic_filter_fn
 //! [#11]: https://github.com/romnn/tracing-perfetto/issues/11
 //!
 //! # Counters
