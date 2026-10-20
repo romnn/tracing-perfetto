@@ -151,15 +151,16 @@ A span that the filter rejects has no slices, and the layer does not see it:
   it, but it can be an unrelated span that happens to be entered.
 - An event that names the rejected span as its explicit parent goes on the thread's track.
 
-The rejected span is `Span::none` only when its callsite's interest is `never`, which tracing
-caches once per callsite for every dispatcher of the process.
+When its callsite's interest is `never`, the rejected span is `Span::none`, and tracing caches
+that interest once per callsite for every dispatcher of the process.
 That is the case for a filter that decides by metadata alone, such as `filter_fn` above or a level
 filter, when no layer of the registry and no other dispatcher in the process enables the callsite.
 A span created inside a task that it instruments on another thread, and a span that names it as
 its explicit parent, then become roots.
 
-With tracing-subscriber 0.3.23, a span rejected only at runtime, under `sometimes` interest, still
-exists in the registry, so its children nest on its nearest recorded ancestor.
+With tracing-subscriber 0.3.23, a span that only per-layer filters reject at runtime, under
+`sometimes` interest, still exists in the registry, so its children nest on its nearest recorded
+ancestor.
 That happens with a filter that reads the context, such as `dynamic_filter_fn`, and when another
 dispatcher in the process enables the callsite, such as the subscriber of another test in the same
 test binary.
