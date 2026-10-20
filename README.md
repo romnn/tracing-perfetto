@@ -152,11 +152,16 @@ A span that the filter rejects has no slices, and the layer does not see it:
 - An event that names the rejected span as its explicit parent goes on the thread's track.
 
 If no layer of the registry enables the rejected span's callsite, as with the single filtered
-layer above, the span is `Span::none`.
+layer above, and no other dispatcher in the process enables it either, the span is `Span::none`.
 A span created inside a task that it instruments on another thread, and a span that names it as
 its explicit parent, then become roots.
 Another layer that enables every callsite keeps the rejected span in the registry and with it the
 nesting, at the cost of creating every span.
+So does another dispatcher in the process that enables the callsite, such as the subscriber of
+another test in the same test binary, because tracing caches one interest per callsite for every
+dispatcher of the process.
+That cache is rebuilt when a dispatcher is created, so it can outlive the dispatcher that enabled
+the callsite.
 Issue [#11] tracks routing the events of a rejected span to its nearest recorded ancestor.
 
 ## Writers
