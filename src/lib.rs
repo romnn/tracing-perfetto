@@ -56,15 +56,14 @@
 //! The layer records every span and event that reaches it.
 //! To record only some, give it a [per-layer filter], which leaves the other layers of the
 //! registry unaffected.
-//! A span that the filter rejects has no slices, and the layer does not see it:
+//! A span that the filter rejects has no slices, and what belongs to it goes on the track of its
+//! nearest recorded ancestor, whichever spans are entered on the recording thread:
 //!
-//! - Its recorded children nest on the track of its nearest recorded ancestor.
-//! - An event inside it goes on the track of the innermost recorded span entered on the
-//!   recording thread, or else on the thread's track.
-//!   That span is the nearest recorded ancestor when the rejected span is entered directly inside
-//!   it, but it can be an unrelated span that happens to be entered.
-//! - An event that names the rejected span as its explicit parent goes on the thread's track.
+//! - Its recorded children nest on that ancestor's track.
+//! - An event inside it, or one that names it as its explicit parent, is an instant on that
+//!   ancestor's track, or on the thread's track when it has no recorded ancestor.
 //!
+//! That holds while the rejected span exists in the registry.
 //! When its callsite's interest is `never`, the rejected span is
 //! [`Span::none`](tracing::Span::none), and tracing caches that interest once per callsite for
 //! every dispatcher of the process.
@@ -73,18 +72,28 @@
 //! callsite.
 //! A span created inside a task that it instruments on another thread, and a span that names it
 //! as its explicit parent, then become roots.
+//! An event that names it as its explicit parent then goes on the thread's track, and an event
+//! inside it belongs to the span entered around it, if any.
 //!
 //! With tracing-subscriber 0.3.23, a span that only per-layer filters reject at runtime, under
-//! `sometimes` interest, still exists in the registry, so its children nest on its nearest
-//! recorded ancestor.
+//! `sometimes` interest, still exists in the registry, so what belongs to it goes on its nearest
+//! recorded ancestor's track.
 //! That happens with a filter that reads the context, such as [`dynamic_filter_fn`], and when
 //! another dispatcher in the process enables the callsite, such as the subscriber of another test
 //! in the same test binary.
 //! The cached interest is rebuilt when a dispatcher is created, so it can outlive the dispatcher
 //! that enabled the callsite.
 //! Another layer that enables every callsite keeps the rejected span in the registry as well, and
-//! with it the nesting, at the cost of creating every span.
-//! Issue [#11] tracks routing the events of a rejected span to its nearest recorded ancestor.
+//! with it the routing to its ancestor, at the cost of creating every span.
+//!
+//! The layer looks a rejected span up through the dispatcher it is part of, which it learns when
+//! that dispatcher is created around it.
+//! As of tracing-subscriber 0.3.23 and tracing-core 0.1.36, it never learns it inside an `Option`
+//! or a `Vec` layer, in a subscriber boxed or wrapped in an `Arc` before it becomes a
+//! [`Dispatch`](tracing::Dispatch), or when [`reload::Handle::reload`] installs it in place of
+//! another layer.
+//! An event inside a rejected span then goes on the track of the innermost recorded span entered
+//! on the recording thread, and one that names it as its explicit parent on the thread's track.
 //!
 //! A filter can select by target or level, or by a field that marks the spans and events to
 //! record:
@@ -111,7 +120,7 @@
 //! [per-layer filter]: tracing_subscriber::Layer::with_filter
 //! [`filter_fn`]: tracing_subscriber::filter::filter_fn
 //! [`dynamic_filter_fn`]: tracing_subscriber::filter::dynamic_filter_fn
-//! [#11]: https://github.com/romnn/tracing-perfetto/issues/11
+//! [`reload::Handle::reload`]: tracing_subscriber::reload::Handle::reload
 //!
 //! # Counters
 //!

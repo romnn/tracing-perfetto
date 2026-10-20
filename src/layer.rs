@@ -17,13 +17,14 @@ use crate::thread_state::ThreadStates;
 use crate::writer::PerfettoWriter;
 use crate::{idl, thread_track};
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tracing::dispatcher::WeakDispatch;
 use tracing::span;
-use tracing::{Event, Id, Subscriber};
-use tracing_subscriber::Layer;
+use tracing::{Dispatch, Event, Id, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::{LookupSpan, SpanRef};
+use tracing_subscriber::{Layer, Registry};
 
 /// A [`Layer`] that streams spans as slices and events as instants into a Perfetto trace.
 ///
@@ -55,6 +56,11 @@ pub struct PerfettoLayer<W> {
     /// The counter tracks that the `counter.*` fields of events write to.
     event_counters: EventCounterTracks,
     lifecycle: Arc<TraceLifecycle>,
+    /// The dispatcher that the layer is part of, through which events find the spans that the
+    /// layer's per-layer filter hides from its context.
+    ///
+    /// It is weak because the dispatcher owns the layer.
+    dispatch: OnceLock<WeakDispatch>,
 }
 
 /// What a [`PerfettoLayer`] records, as its builder methods set it.
@@ -97,6 +103,7 @@ impl<W: PerfettoWriter + Send + Sync + 'static> PerfettoLayer<W> {
             process_memory_rss_track: Arc::new(CounterTrack::new()),
             event_counters: EventCounterTracks::default(),
             lifecycle,
+            dispatch: OnceLock::new(),
         }
     }
 
@@ -303,6 +310,46 @@ impl<W: PerfettoWriter> PerfettoLayer<W> {
         );
         lifetime
     }
+
+    /// Returns the lifetime track of the nearest span that the layer records, among the span
+    /// that `event` belongs to and its ancestors.
+    ///
+    /// An event belongs to its explicit parent, or else to the current span.
+    fn event_span_track<S>(&self, event: &Event<'_>, ctx: &Context<'_, S>) -> Option<u64>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        // The subscriber's current span may be one that the layer's filter rejected, whereas
+        // `Context::lookup_current` skips such a span in favor of a recorded span entered on the
+        // thread, which may be unrelated to the event.
+        let span_id = if event.is_contextual() {
+            ctx.current_span().id()?.clone()
+        } else {
+            event.parent()?.clone()
+        };
+        if let Some(span) = ctx.span(&span_id) {
+            return span_state::nearest_lifetime_track(&span, self.layer_id);
+        }
+
+        // The context hides a span that the layer's filter rejected, so the span is looked up in
+        // the registry itself, through which its ancestors are reached as well.
+        // Only a `Registry` hides spans from a filtered context.
+        if let Some(dispatch) = self.dispatch.get().and_then(WeakDispatch::upgrade)
+            && let Some(registry) = dispatch.downcast_ref::<Registry>()
+        {
+            return registry
+                .span(&span_id)
+                .and_then(|span| span_state::nearest_lifetime_track(&span, self.layer_id));
+        }
+
+        // A layer that never learned its dispatcher, as inside an `Option` or a `Vec` layer or a
+        // `Box` or `Arc` subscriber, or once a reload installed it, has only the context's view of
+        // the spans.
+        // An event inside the rejected span then goes to the innermost recorded span entered on
+        // the thread, and one that names it as its explicit parent to the thread's track.
+        ctx.event_span(event)
+            .and_then(|span| span_state::nearest_lifetime_track(&span, self.layer_id))
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +381,20 @@ where
     S: for<'a> LookupSpan<'a>,
     W: PerfettoWriter + 'static,
 {
+    fn on_register_dispatch(&self, dispatch: &Dispatch) {
+        // Only the creation of a dispatcher around the layer registers it, and attaching the layer
+        // anew forgets the dispatcher, so the layer is registered at most once per attachment.
+        // A wrapper that does not pass the call on, such as an `Option` layer or a `Box`
+        // subscriber, and a reload that installs the layer later leave it without a dispatcher.
+        self.dispatch.get_or_init(|| dispatch.downgrade());
+    }
+
+    fn on_layer(&mut self, _subscriber: &mut S) {
+        // A layer moved out of one subscriber, such as through a reload handle, and attached to
+        // another is part of the new subscriber's dispatcher only, whose creation registers it.
+        self.dispatch = OnceLock::new();
+    }
+
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
         if !self.config.span_lifetimes && !self.config.thread_slices {
             return;
@@ -458,18 +519,7 @@ where
             correlation_id: None,
         };
 
-        // An event belongs to its explicit parent or else the current span, and lands on the
-        // track of the nearest such span that this layer records.
-        let span_track_uuid = ctx.event_span(event).and_then(|event_span| {
-            event_span.scope().find_map(|span| {
-                span.extensions()
-                    .get::<SpanStates>()
-                    .and_then(|states| states.get(self.layer_id))
-                    .and_then(SpanState::lifetime)
-                    .map(|lifetime| lifetime.track_uuid)
-            })
-        });
-        match span_track_uuid {
+        match self.event_span_track(event, &ctx) {
             Some(track_uuid) => self.write_on_span_track(track_uuid, None, instant, timestamp),
             None => self.write_on_thread_track(vec![instant], timestamp),
         }
