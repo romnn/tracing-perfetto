@@ -14,8 +14,8 @@ use tracing::{info, info_span};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 
-/// The bound on waiting for a finish or a held write, far above any scheduling delay on a loaded
-/// machine.
+/// The bound on waiting for a finish, a held write or a layer's drop, far above any scheduling
+/// delay on a loaded machine.
 ///
 /// A finish that deadlocks exceeds it, which fails the test instead of hanging the suite.
 const FINISH_BOUND: Duration = Duration::from_secs(30);
@@ -37,6 +37,15 @@ struct BufferingWriter {
     flushed: Arc<Mutex<Vec<u8>>>,
     /// Whether a flush fails and keeps the pending bytes.
     flush_fails: bool,
+    /// Announces that the writer is dropped, which the layer's drop does after its flush.
+    dropped: mpsc::Sender<()>,
+}
+
+impl Drop for BufferingWriter {
+    fn drop(&mut self) {
+        // The receiver is gone once the test no longer waits for the drop.
+        self.dropped.send(()).ok();
+    }
 }
 
 impl std::io::Write for BufferingWriter {
@@ -54,8 +63,16 @@ impl std::io::Write for BufferingWriter {
     }
 }
 
+/// What the test observes of a [`BufferingWriter`].
+struct BufferedOutput {
+    /// The bytes that the writer has flushed.
+    flushed: Arc<Mutex<Vec<u8>>>,
+    /// Receives once the writer is dropped.
+    dropped: mpsc::Receiver<()>,
+}
+
 /// Returns a layer that writes to a [`BufferingWriter`] behind a `std::sync::Mutex`, as a
-/// `Mutex<BufWriter<File>>` would be, and the bytes that the writer has flushed.
+/// `Mutex<BufWriter<File>>` would be, and what the test observes of that writer.
 ///
 /// The `std::sync::Mutex` is deliberate: it is the writer type that tracing-subscriber implements
 /// [`MakeWriter`] for, so the layer flushes it as it flushes a user's buffered file.
@@ -63,15 +80,21 @@ fn buffering_layer(
     flush_fails: bool,
 ) -> (
     PerfettoLayer<std::sync::Mutex<BufferingWriter>>,
-    Arc<Mutex<Vec<u8>>>,
+    BufferedOutput,
 ) {
     let flushed = Arc::new(Mutex::new(Vec::new()));
+    let (dropped, writer_dropped) = mpsc::channel();
     let writer = BufferingWriter {
         pending: Vec::new(),
         flushed: Arc::clone(&flushed),
         flush_fails,
+        dropped,
     };
-    (PerfettoLayer::new(std::sync::Mutex::new(writer)), flushed)
+    let output = BufferedOutput {
+        flushed,
+        dropped: writer_dropped,
+    };
+    (PerfettoLayer::new(std::sync::Mutex::new(writer)), output)
 }
 
 /// Records [`JOBS`] root spans named `job`, each with a child named `step` and an event inside
@@ -106,7 +129,7 @@ fn expect_every_job_recorded(bytes: &[u8]) -> Result<()> {
 /// of the trace in the buffer, and a short trace with no bytes in the output at all.
 #[gtest]
 fn finish_flushes_a_buffering_writer() -> Result<()> {
-    let (layer, flushed) = buffering_layer(false);
+    let (layer, output) = buffering_layer(false);
     let finish = layer.finish_handle();
     // The dispatch keeps the layer alive, as a global dispatcher would.
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
@@ -114,7 +137,7 @@ fn finish_flushes_a_buffering_writer() -> Result<()> {
 
     finish.finish().or_fail()?;
 
-    expect_every_job_recorded(&flushed.lock())?;
+    expect_every_job_recorded(&output.flushed.lock())?;
     drop(dispatch);
     Ok(())
 }
@@ -126,12 +149,15 @@ fn finish_flushes_a_buffering_writer() -> Result<()> {
 /// the layer.
 #[gtest]
 fn dropping_the_layer_flushes_a_buffering_writer() -> Result<()> {
-    let (layer, flushed) = buffering_layer(false);
+    let (layer, output) = buffering_layer(false);
 
-    // The subscriber, and with it the layer, is dropped once the closure returns.
+    // The subscriber, and with it the layer, is dropped once the closure returns, or later on
+    // another thread: tracing briefly holds every dispatcher from a thread that creates a
+    // dispatcher or registers a callsite, and that thread may then drop the last reference.
     tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), record_jobs);
+    output.dropped.recv_timeout(FINISH_BOUND).or_fail()?;
 
-    expect_every_job_recorded(&flushed.lock())
+    expect_every_job_recorded(&output.flushed.lock())
 }
 
 /// A flush that fails is reported by the finish that flushed, and only by that one.
